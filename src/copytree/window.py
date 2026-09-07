@@ -2,8 +2,10 @@
 
 - 拖入一个或多个文件夹（原生 WM_DROPFILES，ctypes 子类化 Tk 窗口过程），
   按界面所选格式与过滤选项扫描并写入剪贴板；
-- 也可保存为 txt、打开配置文件、卸载 copy-tree；
-- 可选"关闭时驻留托盘"（写入配置 enableTray，默认关闭）。
+- 「保存为 ▾」可把每个文件夹的结果保存为 txt / Markdown / JSON；
+- 结果卡具备就绪态 ⇄ 操作结果态，任一文件夹截断时切换警告态；
+- 设置菜单：关闭时驻留托盘、拖入后自动复制、打开配置、两步确认卸载；
+- 视觉遵循 theme.py（墨林纸意 token）：本模块禁止出现裸色值。
 
 线程模型：扫描在后台线程执行，结果经线程安全队列回传，
 由 Tk 主线程 after 轮询消费；托盘线程动作同样走队列。
@@ -16,14 +18,18 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from loguru import logger
 
+from . import theme
 from .clipboard import copy_to_clipboard
 from .config import get_effective_config, open_config_file, update_config_values
 from .constants import (
+    DEFAULT_OUTPUT_FILENAME_JSON,
+    DEFAULT_OUTPUT_FILENAME_MD,
     DEFAULT_OUTPUT_FILENAME_TXT,
     GENERATED_OUTPUT_FILENAMES,
     SOURCE_CODE_EXTENSIONS,
@@ -75,6 +81,13 @@ _FORMAT_LABELS = {
 
 _FORMAT_VALUE_TO_LABEL = {value: label for label, value in _FORMAT_LABELS.items()}
 
+# 预览区只展示 tree_text 的前 N 行（与设计稿一致）
+_PREVIEW_LINE_COUNT = 15
+
+# 保存格式的文件名与内容形态：txt 沿用 tree_text（兼容不变），
+# md/json 用对应格式的已格式化输出，保证文件内容与扩展名一致。
+_SAVE_KINDS = ("txt", "md", "json")
+
 # 安装状态横幅的按钮规格：状态 → (按钮文本, 动作键)。
 # 状态字符串与 __main__ 的 _INSTALL_STATE_* 常量保持契约一致——本模块禁止
 # import __main__（它延迟导入 window，会循环导入），状态以普通字符串参数传入。
@@ -86,6 +99,14 @@ _BANNER_BUTTONS = {
     "repair": ("重新安装", "repair"),
     "migrate": ("迁移到标准位置", "migrate"),
 }
+
+
+def _fmt_count(n) -> str:
+    """千分位计数：结果卡与文件数列共用。"""
+    try:
+        return f"{max(int(n), 0):,}"
+    except (TypeError, ValueError):
+        return "0"
 
 
 def _initial_ui_values(config: dict) -> dict:
@@ -111,7 +132,8 @@ class DropWindow:
 
         self.root = tk.Tk()
         self.root.title(f"copy-tree v{VERSION} — 拖入文件夹即可复制目录树")
-        self.root.minsize(520, 460)
+        self.root.geometry("780x640")
+        self.root.minsize(560, 520)
 
         self.actions: queue.Queue = queue.Queue()
         self._old_wndproc: ctypes.c_ssize_t | None = None
@@ -119,8 +141,18 @@ class DropWindow:
         self._worker: threading.Thread | None = None
         self._tray_started = False
 
+        # 交互状态：保存格式 / 复制反馈 / 菜单两步确认 / 日志抽屉
+        self._save_kind = "txt"
+        self._copy_flash_active = False
+        self._uninstall_armed = False
+        self._uninstall_after_id = None
+        self._clear_armed = False
+        self._clear_after_id = None
+        self._log_expanded = False
+
         self._build_ui()
         self._install_drag_drop()
+        self._tint_titlebar()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._poll)
 
@@ -129,75 +161,271 @@ class DropWindow:
     def _build_ui(self):
         config = get_effective_config()
         ui = _initial_ui_values(config)
+        self.tray_var = tk.BooleanVar(value=bool(config.get("enableTray", False)))
+        # 占位新配置项 auto_copy_on_drop：config.py 不落地该键，缺省 False，
+        # 仅经设置菜单开关控制拖入后是否自动复制。
+        self.auto_copy_var = tk.BooleanVar(value=bool(config.get("auto_copy_on_drop", False)))
 
-        top = ttk.Frame(self.root, padding=8)
+        style = ttk.Style()
+        theme.apply_theme(style)
+        self._configure_styles(style)
+
+        top = ttk.Frame(self.root, padding=theme.PAD_WINDOW)
         top.pack(fill="both", expand=True)
 
+        # 安装状态横幅（机制原样保留），置于工具行上方
         self._build_status_banner(top)
+        self._build_tool_row(top, ui)
+        self._build_scan_row(top, ui)
+        self._build_folder_table(top)
+        self._build_preview(top)
+        self._build_action_card(top)
+        self._build_drawer(top)
 
-        list_frame = ttk.Frame(top)
-        list_frame.pack(fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(list_frame)
-        scrollbar.pack(side="right", fill="y")
-        self.folder_list = tk.Listbox(list_frame, height=6, selectmode="extended", yscrollcommand=scrollbar.set)
-        self.folder_list.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=self.folder_list.yview)
+        self._refresh_ready_card()
 
-        list_buttons = ttk.Frame(top)
-        list_buttons.pack(fill="x", pady=(4, 8))
-        ttk.Button(list_buttons, text="添加文件夹…", command=self._add_folder_dialog).pack(side="left")
-        ttk.Button(list_buttons, text="移除选中", command=self._remove_selected).pack(side="left", padx=4)
-        ttk.Button(list_buttons, text="清空", command=lambda: self.folder_list.delete(0, "end")).pack(side="left")
+    def _configure_styles(self, style):
+        """墨林纸意派生样式：颜色/字体/间距全部取自 theme 常量，禁止裸色值。"""
+        # 分组小标签（字距加宽的弱提示）
+        style.configure("GroupLabel.TLabel", background=theme.PAPER, foreground=theme.FAINT,
+                        font=(theme.FONT_SANS, theme.SIZE_SMALL, "bold"))
+        style.configure("FaintSmall.TLabel", background=theme.PAPER, foreground=theme.FAINT,
+                        font=(theme.FONT_SANS, theme.SIZE_SMALL))
+        style.configure("DrawerLog.TLabel", background=theme.PAPER, foreground=theme.MUTED,
+                        font=(theme.FONT_MONO, theme.SIZE_SMALL))
+        # 扫描范围条（表面底）
+        style.configure("ScanRow.TFrame", background=theme.SURFACE)
+        style.configure("ScanRowGroup.TLabel", background=theme.SURFACE, foreground=theme.FAINT,
+                        font=(theme.FONT_SANS, theme.SIZE_SMALL, "bold"))
+        style.configure("ScanRow.TCheckbutton", background=theme.SURFACE, foreground=theme.MUTED,
+                        focusthickness=0)
+        style.map("ScanRow.TCheckbutton", background=[("active", theme.SURFACE)])
+        # 文件夹表（Treeview）
+        style.configure("FolderTree.Treeview", background=theme.WHITE, fieldbackground=theme.WHITE,
+                        foreground=theme.INK, rowheight=26, borderwidth=0, focusthickness=0)
+        style.map("FolderTree.Treeview",
+                  background=[("selected", theme.PINE)],
+                  foreground=[("selected", theme.WHITE)])
+        style.configure("FolderTree.Treeview.Heading", background=theme.WHITE, foreground=theme.FAINT,
+                        relief="flat", borderwidth=0, padding=(theme.PAD_ROW, 3),
+                        font=(theme.FONT_SANS, theme.SIZE_SMALL, "bold"))
+        style.map("FolderTree.Treeview.Heading", background=[("active", theme.WHITE)])
+        # 主 / 成功 / 危险 / 链接按钮
+        style.configure("Primary.TButton", background=theme.PINE, foreground=theme.WHITE,
+                        bordercolor=theme.PINE, focusthickness=0, padding=(theme.PAD_GROUP, 5),
+                        font=(theme.FONT_SANS, theme.SIZE_BODY, "bold"))
+        style.map("Primary.TButton",
+                  background=[("active", theme.PINE_HOVER), ("pressed", theme.PINE_HOVER)],
+                  foreground=[("active", theme.WHITE), ("pressed", theme.WHITE)])
+        style.configure("Success.TButton", background=theme.SUCCESS, foreground=theme.WHITE,
+                        bordercolor=theme.SUCCESS, focusthickness=0, padding=(theme.PAD_GROUP, 5))
+        style.configure("DangerGhost.TButton", background=theme.WHITE, foreground=theme.DANGER,
+                        bordercolor=theme.DANGER_LINE, focusthickness=0)
+        style.map("DangerGhost.TButton",
+                  background=[("active", theme.WHITE)],
+                  bordercolor=[("active", theme.DANGER)])
+        style.configure("DangerConfirm.TButton", background=theme.DANGER, foreground=theme.WHITE,
+                        bordercolor=theme.DANGER, focusthickness=0)
+        style.configure("Link.TButton", relief="flat", borderwidth=0, background=theme.PAPER,
+                        foreground=theme.MUTED, focusthickness=0, padding=0)
+        style.map("Link.TButton",
+                  background=[("active", theme.PAPER)],
+                  foreground=[("active", theme.PINE)])
+        # 结果卡两态（正常 / 截断警告）
+        style.configure("ResultCard.TFrame", background=theme.SURFACE)
+        style.configure("ResultCard.TLabel", background=theme.SURFACE, foreground=theme.INK)
+        style.configure("ResultCardWarn.TFrame", background=theme.WARN_BG,
+                        bordercolor=theme.AMBER, relief="solid", borderwidth=1)
+        style.configure("ResultCardWarn.TLabel", background=theme.WARN_BG, foreground=theme.WARN_TEXT)
+        style.configure("ResultCardLink.TLabel", background=theme.WARN_BG, foreground=theme.WARN_TEXT,
+                        font=(theme.FONT_SANS, theme.SIZE_SMALL, "underline"))
+        # 两个 Menubutton（设置 / 保存为）
+        style.configure("Settings.TMenubutton", background=theme.PAPER, foreground=theme.INK,
+                        bordercolor=theme.BORDER, focusthickness=0)
+        style.map("Settings.TMenubutton",
+                  background=[("active", theme.PAPER)],
+                  bordercolor=[("active", theme.PINE)])
+        style.configure("Ghost.TMenubutton", background=theme.WHITE, foreground=theme.INK,
+                        bordercolor=theme.BORDER, focusthickness=0, padding=(theme.PAD_ROW, 5))
+        style.map("Ghost.TMenubutton",
+                  background=[("active", theme.SURFACE)],
+                  bordercolor=[("active", theme.PINE)])
 
-        options = ttk.LabelFrame(top, text="选项", padding=8)
-        options.pack(fill="x")
-        first_row = ttk.Frame(options)
-        first_row.pack(fill="x")
-        ttk.Label(first_row, text="格式：").pack(side="left")
+    def _build_tool_row(self, parent, ui):
+        """行 1：输出格式 + 内容选项 + 右侧设置菜单。"""
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(0, theme.PAD_ROW))
+        ttk.Label(row, text="输出格式", style="GroupLabel.TLabel").pack(side="left")
         self.format_var = tk.StringVar(value=ui["format_label"])
         self.format_box = ttk.Combobox(
-            first_row, textvariable=self.format_var, state="readonly",
+            row, textvariable=self.format_var, state="readonly",
             values=list(_FORMAT_LABELS), width=16,
         )
-        self.format_box.pack(side="left", padx=(0, 12))
+        self.format_box.pack(side="left", padx=(theme.PAD_ROW, theme.PAD_GROUP))
         self.size_var = tk.BooleanVar(value=ui["show_size"])
         self.time_var = tk.BooleanVar(value=ui["show_time"])
-        ttk.Checkbutton(first_row, text="含大小", variable=self.size_var).pack(side="left")
-        ttk.Checkbutton(first_row, text="含修改时间", variable=self.time_var).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(row, text="含大小", variable=self.size_var).pack(side="left")
+        ttk.Checkbutton(row, text="含修改时间", variable=self.time_var).pack(
+            side="left", padx=(theme.PAD_ROW, 0))
+        self._build_settings_menu(row)
 
-        second_row = ttk.Frame(options)
-        second_row.pack(fill="x", pady=(6, 0))
+    def _build_settings_menu(self, parent):
+        """「⚙ 设置 ▾」：两个开关 + 打开配置 + 卸载（菜单内两步确认）。
+
+        卸载入口仅在打包运行（sys.frozen）时出现，与旧版底部按钮的显隐条件一致。
+        """
+        self.settings_button = ttk.Menubutton(
+            parent, text="⚙ 设置 ▾", style="Settings.TMenubutton", direction="below")
+        self._settings_menu = tk.Menu(self.settings_button, tearoff=0)
+        self._settings_menu.add_checkbutton(
+            label="关闭时驻留托盘", variable=self.tray_var, command=self._on_tray_toggle)
+        self._settings_menu.add_checkbutton(label="拖入后自动复制", variable=self.auto_copy_var)
+        self._settings_menu.add_separator()
+        self._settings_menu.add_command(label="打开配置文件", command=lambda: open_config_file())
+        if getattr(sys, "frozen", False):
+            self._settings_menu.add_command(
+                label="卸载 copy-tree…", command=self._on_uninstall_menu_selected)
+            self._uninstall_menu_index = self._settings_menu.index("end")
+        else:
+            self._uninstall_menu_index = None
+        self.settings_button.configure(menu=self._settings_menu)
+        self.settings_button.pack(side="right")
+
+    def _build_scan_row(self, parent, ui):
+        """行 2：扫描范围过滤选项 + 右侧列表操作（表面底横条）。"""
+        row = ttk.Frame(parent, style="ScanRow.TFrame", padding=(theme.PAD_ROW, 6))
+        row.pack(fill="x")
+        ttk.Label(row, text="扫描范围", style="ScanRowGroup.TLabel").pack(side="left")
         self.hide_git_var = tk.BooleanVar(value=True)
         self.gitignore_var = tk.BooleanVar(value=ui["gitignore"])
         self.source_only_var = tk.BooleanVar(value=False)
-        self.tray_var = tk.BooleanVar(value=bool(config.get("enableTray", False)))
-        ttk.Checkbutton(second_row, text="隐藏 .git 等目录", variable=self.hide_git_var).pack(side="left")
-        ttk.Checkbutton(second_row, text="遵循 .gitignore", variable=self.gitignore_var).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(second_row, text="仅源码文件", variable=self.source_only_var).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(second_row, text="关闭时驻留托盘", variable=self.tray_var, command=self._on_tray_toggle).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(row, text="隐藏 .git 等目录", variable=self.hide_git_var,
+                        style="ScanRow.TCheckbutton").pack(side="left", padx=(theme.PAD_GROUP, 0))
+        ttk.Checkbutton(row, text="遵循 .gitignore", variable=self.gitignore_var,
+                        style="ScanRow.TCheckbutton").pack(side="left", padx=(theme.PAD_ROW, 0))
+        ttk.Checkbutton(row, text="仅源码文件", variable=self.source_only_var,
+                        style="ScanRow.TCheckbutton").pack(side="left", padx=(theme.PAD_ROW, 0))
+        ttk.Frame(row, style="ScanRow.TFrame").pack(side="left", fill="both", expand=True)
+        separator = tk.Frame(row, bg=theme.BORDER, width=1, height=16)
+        separator.pack(side="left", fill="y", padx=(0, theme.PAD_ROW))
+        ttk.Button(row, text="添加文件夹…", command=self._add_folder_dialog).pack(side="left")
+        self.clear_button = ttk.Button(row, text="清空全部", style="DangerGhost.TButton",
+                                       command=self._on_clear_clicked)
+        self.clear_button.pack(side="left", padx=(theme.PAD_ROW, 0))
 
-        buttons = ttk.Frame(top)
-        buttons.pack(fill="x", pady=8)
-        self.copy_button = ttk.Button(buttons, text="复制到剪贴板", command=self._on_copy)
-        self.copy_button.pack(side="left")
-        ttk.Button(buttons, text="保存为 txt", command=self._on_save_txt).pack(side="left", padx=4)
-        ttk.Button(buttons, text="打开配置文件", command=lambda: open_config_file()).pack(side="left", padx=4)
-        if getattr(sys, "frozen", False):
-            ttk.Button(buttons, text="卸载 copy-tree…", command=self._on_uninstall).pack(side="right")
+    def _build_folder_table(self, parent):
+        """文件夹表：3 列（文件夹 / 文件数 / ✕），替代旧 Listbox。
 
-        log_frame = ttk.LabelFrame(top, text="结果", padding=4)
-        log_frame.pack(fill="both", expand=True)
-        log_scroll = ttk.Scrollbar(log_frame)
+        拖拽接线不受影响：_install_drag_drop 挂在顶层窗口 hwnd 上，不挂列表控件。
+        """
+        wrap = tk.Frame(parent, bg=theme.WHITE, highlightbackground=theme.LINE, highlightthickness=1)
+        wrap.pack(fill="x")
+        self.folder_tree = ttk.Treeview(
+            wrap, columns=("path", "files", "del"), show="headings",
+            selectmode="extended", height=4, style="FolderTree.Treeview",
+        )
+        self.folder_tree.heading("path", text="文件夹")
+        self.folder_tree.heading("files", text="文件数")
+        self.folder_tree.heading("del", text="")
+        self.folder_tree.column("path", width=420, stretch=True)
+        self.folder_tree.column("files", width=90, anchor="e", stretch=False)
+        self.folder_tree.column("del", width=36, anchor="center", stretch=False)
+        self.folder_tree.tag_configure("row", font=(theme.FONT_MONO, theme.SIZE_BODY),
+                                       foreground=theme.INK)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.folder_tree.yview)
+        self.folder_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.folder_tree.pack(side="left", fill="both", expand=True)
+        self.folder_tree.bind("<Delete>", lambda _event: self._remove_selected())
+        self.folder_tree.bind("<Button-1>", self._on_tree_click)
+
+    def _build_preview(self, parent):
+        """预览区（兼任拖放目标提示）：头部说明 + 只读等宽文本。
+
+        设计稿的虚线边框 tkinter 无法呈现，按 brief 用 1px BORDER 实线替代。
+        """
+        box = tk.Frame(parent, bg=theme.PAPER, highlightbackground=theme.BORDER, highlightthickness=1)
+        box.pack(fill="both", expand=True, pady=(theme.PAD_GROUP, 0))
+        head = tk.Frame(box, bg=theme.PAPER)
+        head.pack(fill="x")
+        ttk.Label(head, text="输出预览 · 前 15 行", style="FaintSmall.TLabel").pack(
+            side="left", padx=(theme.PAD_ROW, 0), pady=4)
+        hint = tk.Frame(head, bg=theme.PAPER)
+        hint.pack(side="right", padx=(0, theme.PAD_ROW))
+        tk.Label(hint, text="＋", bg=theme.PAPER, fg=theme.AMBER,
+                 font=(theme.FONT_SANS, theme.SIZE_BODY, "bold")).pack(side="left")
+        tk.Label(hint, text=" 将文件夹拖到此处可随时添加", bg=theme.PAPER, fg=theme.MUTED,
+                 font=(theme.FONT_SANS, theme.SIZE_SMALL)).pack(side="left")
+        self.preview_text = tk.Text(
+            box, height=6, state="disabled", wrap="none",
+            bg=theme.PAPER, fg=theme.INK, insertbackground=theme.INK,
+            relief="flat", highlightthickness=0, padx=10, pady=6,
+            font=(theme.FONT_MONO, theme.SIZE_SMALL),
+        )
+        self.preview_text.pack(fill="both", expand=True)
+        self.preview_text.tag_configure("dim", foreground=theme.FAINT)
+        self.preview_text.config(state="normal")
+        self.preview_text.insert("1.0", "将文件夹拖到此处，复制或保存后此处预览输出前 15 行。", "dim")
+        self.preview_text.config(state="disabled")
+
+    def _build_action_card(self, parent):
+        """结果卡：状态文字 + 「保存为 ▾」+ 主按钮「复制到剪贴板」。"""
+        self.result_card = ttk.Frame(parent, style="ResultCard.TFrame",
+                                     padding=(theme.PAD_GROUP, theme.PAD_ROW + 2))
+        self.result_card.pack(fill="x", pady=(theme.PAD_GROUP, 0))
+        self.status_var = tk.StringVar(value="")
+        self.result_status = ttk.Label(self.result_card, textvariable=self.status_var,
+                                       style="ResultCard.TLabel")
+        self.result_status.pack(side="left", fill="x", expand=True)
+        self.result_link = ttk.Label(self.result_card, text="调整上限",
+                                     style="ResultCardLink.TLabel", cursor="hand2")
+        # ttk.Label 无 command 选项，链接点击用 Button-1 绑定
+        self.result_link.bind("<Button-1>", lambda _event: self._open_limit_config())
+        self._build_save_menu(self.result_card)
+        self.copy_button = ttk.Button(self.result_card, text="复制到剪贴板",
+                                      style="Primary.TButton", command=self._on_copy)
+        self.save_button.pack(side="left", padx=(theme.PAD_ROW, 0))
+        self.copy_button.pack(side="left", padx=(theme.PAD_ROW, 0))
+
+    def _build_save_menu(self, parent):
+        """「保存为 ▾」菜单：txt / Markdown / JSON 三项，分别写对应输出文件。"""
+        self.save_button = ttk.Menubutton(parent, text="保存为 ▾",
+                                          style="Ghost.TMenubutton", direction="above")
+        self._save_menu = tk.Menu(self.save_button, tearoff=0)
+        self._save_menu.add_command(
+            label="txt 文本（directory_tree.txt）", command=lambda: self._on_save("txt"))
+        self._save_menu.add_command(
+            label="Markdown（directory_tree.md）", command=lambda: self._on_save("md"))
+        self._save_menu.add_command(
+            label="JSON（directory_tree.json）", command=lambda: self._on_save("json"))
+        self.save_button.configure(menu=self._save_menu)
+
+    def _build_drawer(self, parent):
+        """底部抽屉：最近一条日志 + 「展开日志 ▾/▴」切换日志区显隐（默认折叠）。"""
+        self.drawer_frame = ttk.Frame(parent)
+        self.drawer_frame.pack(fill="x", pady=(theme.PAD_ROW, 0))
+        self.latest_log_var = tk.StringVar(value="尚无日志")
+        ttk.Label(self.drawer_frame, textvariable=self.latest_log_var,
+                  style="DrawerLog.TLabel").pack(side="left")
+        self.log_toggle_button = ttk.Button(self.drawer_frame, text="展开日志 ▾",
+                                            style="Link.TButton", width=14,
+                                            command=self._toggle_log)
+        self.log_toggle_button.pack(side="right")
+        # 日志区默认折叠：先创建不布局，展开时插到抽屉行之前
+        self._log_frame = ttk.Frame(parent)
+        log_scroll = ttk.Scrollbar(self._log_frame)
         log_scroll.pack(side="right", fill="y")
-        self.log_text = tk.Text(log_frame, height=8, state="disabled", wrap="none", yscrollcommand=log_scroll.set)
+        self.log_text = tk.Text(
+            self._log_frame, height=8, state="disabled", wrap="none",
+            bg=theme.WHITE, fg=theme.INK, insertbackground=theme.INK,
+            relief="flat", highlightthickness=1, highlightbackground=theme.LINE,
+            font=(theme.FONT_MONO, theme.SIZE_SMALL), yscrollcommand=log_scroll.set,
+        )
         self.log_text.pack(fill="both", expand=True)
         log_scroll.config(command=self.log_text.yview)
 
-        self.status_var = tk.StringVar(value="就绪。拖入文件夹或点击「添加文件夹」开始。")
-        ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(6, 2)).pack(fill="x", side="bottom")
-
     def _build_status_banner(self, parent):
-        """按安装状态在列表区上方渲染提示横幅；ok 态不创建任何控件。
+        """按安装状态在工具行上方渲染提示横幅；ok 态不创建任何控件。
 
         install_actions 未注入对应动作键时不渲染按钮（只提示）。
         """
@@ -240,6 +468,102 @@ class DropWindow:
             self._banner_frame.destroy()
             self._banner_frame = None
 
+    # ── 结果卡状态机 ──
+
+    def _apply_card_style(self, warn: bool):
+        """结果卡视觉：正常（表面底）⇄ 警告（警告底 + 强调文字）。"""
+        if warn:
+            self.result_card.configure(style="ResultCardWarn.TFrame")
+            self.result_status.configure(style="ResultCardWarn.TLabel")
+        else:
+            self.result_card.configure(style="ResultCard.TFrame")
+            self.result_status.configure(style="ResultCard.TLabel")
+
+    def _refresh_ready_card(self):
+        """就绪态：列表任何增删后立即回到此态，文件数按当前行实时重算。"""
+        self.result_link.pack_forget()
+        self._apply_card_style(warn=False)
+        if self.folder_tree.get_children():
+            self.status_var.set(
+                f"共 {_fmt_count(self._sum_row_counts())} 个文件待复制，结果将写入剪贴板。")
+        else:
+            self.status_var.set("就绪。拖入文件夹或点击「添加文件夹」开始。")
+
+    def _show_result_card(self, payload: dict):
+        """操作结果态：copy/save 完成后由 _poll 调用；任一文件夹截断切警告态。"""
+        if payload.get("truncated"):
+            self.status_var.set(payload.get("warn_message") or payload.get("message", ""))
+            self.result_link.pack(side="left", padx=(theme.PAD_ROW, 0), before=self.save_button)
+            self._apply_card_style(warn=True)
+        else:
+            self.result_link.pack_forget()
+            self._apply_card_style(warn=False)
+
+    def _open_limit_config(self):
+        """警告态的「调整上限」：打开配置文件调整 maxFiles。"""
+        open_config_file()
+
+    # ── 列表行操作（ttk.Treeview 等价于旧 folder_list.get/insert/delete）──
+
+    def _iter_folder_paths(self):
+        paths = []
+        for iid in self.folder_tree.get_children():
+            values = self.folder_tree.item(iid, "values")
+            if values:
+                paths.append(str(values[0]))
+        return paths
+
+    def _sum_row_counts(self) -> int:
+        total = 0
+        for iid in self.folder_tree.get_children():
+            values = self.folder_tree.item(iid, "values")
+            try:
+                total += int(str(values[1]).replace(",", ""))
+            except (TypeError, ValueError, IndexError):
+                continue
+        return total
+
+    def _add_folder_row(self, path: str) -> bool:
+        if path in self._iter_folder_paths():
+            return False
+        self.folder_tree.insert("", "end", values=(path, "—", "✕"), tags=("row",))
+        return True
+
+    def _remove_row(self, iid):
+        self.folder_tree.delete(iid)
+        self._refresh_ready_card()
+
+    def _remove_selected(self):
+        for iid in self.folder_tree.selection():
+            self._remove_row(iid)
+
+    def _on_tree_click(self, event):
+        """点击第三列（✕）删除对应行；其余列保持原生选择行为。"""
+        if self.folder_tree.identify_column(event.x) != "#3":
+            return
+        iid = self.folder_tree.identify_row(event.y)
+        if iid:
+            self._remove_row(iid)
+
+    def _on_clear_clicked(self):
+        """「清空全部」两步确认（设计稿交互态）：首点武装 2.5 秒，二点执行。"""
+        if not self._clear_armed:
+            self._clear_armed = True
+            self.clear_button.config(text="确认清空？", style="DangerConfirm.TButton")
+            self._clear_after_id = self.root.after(2500, self._disarm_clear)
+            return
+        self._disarm_clear()
+        for iid in self.folder_tree.get_children():
+            self.folder_tree.delete(iid)
+        self._refresh_ready_card()
+
+    def _disarm_clear(self):
+        self._clear_armed = False
+        self.clear_button.config(text="清空全部", style="DangerGhost.TButton")
+        if self._clear_after_id is not None:
+            self.root.after_cancel(self._clear_after_id)
+            self._clear_after_id = None
+
     # ── 原生拖拽 ──
 
     def _install_drag_drop(self):
@@ -281,12 +605,18 @@ class DropWindow:
             shell32.DragQueryFileW(hdrop, i, buf, length + 1)
             dropped.append(buf.value)
         shell32.DragFinish(hdrop)
+        dropped_dirs = False
         for path in dropped:
             if os.path.isdir(path):
-                if path not in self.folder_list.get(0, "end"):
-                    self.folder_list.insert("end", path)
+                self._add_folder_row(path)
+                dropped_dirs = True
             else:
                 self._append_log(f"[跳过] 不是文件夹：{path}")
+        if dropped_dirs:
+            self._refresh_ready_card()
+            if self.auto_copy_var.get():
+                # 「拖入后自动复制」：拖入文件夹后触发一次复制
+                self._on_copy()
 
     # ── 动作 ──
 
@@ -294,12 +624,8 @@ class DropWindow:
         path = filedialog.askdirectory(title="选择要扫描的文件夹")
         if path:
             path = os.path.normpath(path)
-            if path not in self.folder_list.get(0, "end"):
-                self.folder_list.insert("end", path)
-
-    def _remove_selected(self):
-        for index in reversed(self.folder_list.curselection()):
-            self.folder_list.delete(index)
+            if self._add_folder_row(path):
+                self._refresh_ready_card()
 
     def _on_tray_toggle(self):
         update_config_values({"enableTray": bool(self.tray_var.get())})
@@ -307,10 +633,35 @@ class DropWindow:
             self._ensure_tray()
 
     def _on_copy(self):
+        if self._copy_flash_active:  # 「已复制 ✓」反馈期间防重入
+            return
         self._run_action(copy=True, save=False)
 
-    def _on_save_txt(self):
+    def _on_save(self, kind: str):
+        if kind not in _SAVE_KINDS:
+            return
+        self._save_kind = kind
         self._run_action(copy=False, save=True)
+
+    def _on_uninstall_menu_selected(self):
+        """菜单内两步确认：首点武装（3 秒不点弹回），二点进入既有卸载确认流程。"""
+        if self._uninstall_armed:
+            if self._uninstall_after_id is not None:
+                self.root.after_cancel(self._uninstall_after_id)
+                self._uninstall_after_id = None
+            self._uninstall_armed = False
+            self._settings_menu.entryconfig(self._uninstall_menu_index, label="卸载 copy-tree…")
+            self._on_uninstall()
+            return
+        self._uninstall_armed = True
+        self._settings_menu.entryconfig(self._uninstall_menu_index, label="⚠ 再点一次确认卸载")
+        self._uninstall_after_id = self.root.after(3000, self._disarm_uninstall)
+
+    def _disarm_uninstall(self):
+        self._uninstall_after_id = None
+        self._uninstall_armed = False
+        if self._settings_menu is not None:
+            self._settings_menu.entryconfig(self._uninstall_menu_index, label="卸载 copy-tree…")
 
     def _on_uninstall(self):
         if not messagebox.askyesno(
@@ -322,8 +673,18 @@ class DropWindow:
         subprocess.Popen([sys.executable, "--uninstall"])
         self.root.destroy()
 
+    def _flash_copy_button(self):
+        """复制成功反馈：文字变「已复制 ✓」2 秒后还原，期间 _on_copy 防重入。"""
+        self._copy_flash_active = True
+        self.copy_button.config(text="已复制 ✓", style="Success.TButton")
+        self.root.after(2000, self._reset_copy_button)
+
+    def _reset_copy_button(self):
+        self._copy_flash_active = False
+        self.copy_button.config(text="复制到剪贴板", style="Primary.TButton")
+
     def _run_action(self, copy: bool, save: bool):
-        folders = list(self.folder_list.get(0, "end"))
+        folders = self._iter_folder_paths()
         if not folders:
             self.status_var.set("请先添加要扫描的文件夹。")
             return
@@ -342,13 +703,18 @@ class DropWindow:
         self.copy_button.config(state="disabled")
         self.status_var.set("扫描中…")
         self._worker = threading.Thread(
-            target=self._worker_main, args=(folders, opts, copy, save), daemon=True
+            target=self._worker_main, args=(folders, opts, copy, save, self._save_kind),
+            daemon=True,
         )
         self._worker.start()
 
-    def _worker_main(self, folders, opts, do_copy, do_save):
+    def _worker_main(self, folders, opts, do_copy, do_save, save_kind="txt"):
         fmt = opts["format"]
         outputs = []
+        total_files = 0
+        any_truncated = False
+        saved_name = None
+        saved_count = 0
         for folder in folders:
             try:
                 config = get_effective_config()
@@ -390,6 +756,13 @@ class DropWindow:
                     tree_text, fmt, result=result, show_size=opts["size"], show_time=opts["time"]
                 )
                 outputs.append(output)
+                total_files += int(result.total_files)
+                if result.truncated:
+                    any_truncated = True
+
+                # 表格文件数回填 + 预览填充都经队列回 Tk 主线程执行
+                self.actions.put(("count", (folder, int(result.total_files))))
+                self.actions.put(("preview", tree_text))
 
                 note = f"{result.total_files} 个文件，{result.total_dirs} 个文件夹"
                 if result.truncated:
@@ -397,10 +770,25 @@ class DropWindow:
                 self.actions.put(("log", f"[完成] {folder} — {note}"))
 
                 if do_save:
-                    save_path = os.path.join(folder, DEFAULT_OUTPUT_FILENAME_TXT)
+                    if save_kind == "md":
+                        filename = DEFAULT_OUTPUT_FILENAME_MD
+                        content = format_output(
+                            tree_text, "markdown", result=result,
+                            show_size=opts["size"], show_time=opts["time"])
+                    elif save_kind == "json":
+                        filename = DEFAULT_OUTPUT_FILENAME_JSON
+                        content = format_output(
+                            tree_text, "json", result=result,
+                            show_size=opts["size"], show_time=opts["time"])
+                    else:  # txt：沿用 tree_text，行为与旧版完全一致
+                        filename = DEFAULT_OUTPUT_FILENAME_TXT
+                        content = tree_text
+                    save_path = os.path.join(folder, filename)
                     try:
                         with open(save_path, "w", encoding="utf-8") as f:
-                            f.write(tree_text)
+                            f.write(content)
+                        saved_count += 1
+                        saved_name = filename
                         self.actions.put(("log", f"[保存] {save_path}"))
                     except OSError as e:
                         self.actions.put(("log", f"[失败] 保存 {save_path}：{e}"))
@@ -411,12 +799,74 @@ class DropWindow:
         if do_copy and outputs:
             combined = "\n\n".join(outputs)
             if copy_to_clipboard(combined):
-                self.actions.put(("done", f"已复制 {len(outputs)} 个目录树（{fmt} 格式，{len(combined)} 字符）"))
+                self.actions.put(("done", {
+                    "action": "copy", "copy_ok": True,
+                    "truncated": any_truncated, "files": total_files,
+                    "message": f"已复制 {_fmt_count(total_files)} 个文件，结果已写入剪贴板。",
+                    "warn_message": f"已复制 {_fmt_count(total_files)} 个文件，超出上限，结果可能不完整",
+                }))
             else:
                 self.actions.put(("log", "[失败] 剪贴板写入失败，请重试"))
-                self.actions.put(("done", "复制失败"))
+                self.actions.put(("done", {
+                    "action": "copy", "copy_ok": False,
+                    "truncated": False, "files": total_files,
+                    "message": "复制失败", "warn_message": "",
+                }))
+        elif do_copy:
+            self.actions.put(("done", {
+                "action": "copy", "copy_ok": False,
+                "truncated": any_truncated, "files": total_files,
+                "message": "没有可复制的内容。", "warn_message": "",
+            }))
+        elif do_save:
+            if saved_count:
+                message = f"已保存 {saved_name} 到 {saved_count} 个文件夹。"
+                warn_message = f"已保存 {saved_name}，超出上限，结果可能不完整"
+            else:
+                message, warn_message = "保存失败，详见日志。", ""
+            self.actions.put(("done", {
+                "action": "save", "copy_ok": False,
+                "truncated": any_truncated, "files": total_files,
+                "message": message, "warn_message": warn_message,
+            }))
         else:
-            self.actions.put(("done", "处理完成。" if not do_copy else "没有可复制的内容。"))
+            self.actions.put(("done", {
+                "action": None, "copy_ok": False,
+                "truncated": any_truncated, "files": total_files,
+                "message": "处理完成。", "warn_message": "",
+            }))
+
+    # ── 预览与日志 ──
+
+    def _update_preview(self, tree_text: str):
+        """把 tree_text 前 15 行写入只读预览区；超出时附省略提示行。"""
+        lines = tree_text.splitlines()
+        self.preview_text.config(state="normal")
+        self.preview_text.delete("1.0", "end")
+        if lines:
+            self.preview_text.insert("1.0", "\n".join(lines[:_PREVIEW_LINE_COUNT]))
+            if len(lines) > _PREVIEW_LINE_COUNT:
+                self.preview_text.insert("end", f"\n… 仅预览前 {_PREVIEW_LINE_COUNT} 行", "dim")
+        else:
+            self.preview_text.insert("1.0", "（该文件夹没有可显示的内容）", "dim")
+        self.preview_text.config(state="disabled")
+
+    def _update_row_count(self, path: str, total: int):
+        """扫描完成后按路径回填表格「文件数」列。"""
+        for iid in self.folder_tree.get_children():
+            values = self.folder_tree.item(iid, "values")
+            if values and str(values[0]) == str(path):
+                self.folder_tree.set(iid, "files", _fmt_count(total))
+                return
+
+    def _toggle_log(self):
+        if self._log_expanded:
+            self._log_frame.pack_forget()
+            self.log_toggle_button.config(text="展开日志 ▾")
+        else:
+            self._log_frame.pack(fill="x", before=self.drawer_frame)
+            self.log_toggle_button.config(text="收起日志 ▴")
+        self._log_expanded = not self._log_expanded
 
     # ── 托盘与消息泵 ──
 
@@ -455,9 +905,21 @@ class DropWindow:
                 kind, payload = self.actions.get_nowait()
                 if kind == "log":
                     self._append_log(payload)
+                elif kind == "count":
+                    path, total = payload
+                    self._update_row_count(path, total)
+                elif kind == "preview":
+                    self._update_preview(payload)
                 elif kind == "done":
                     self.copy_button.config(state="normal")
-                    self.status_var.set(payload)
+                    if isinstance(payload, dict):
+                        # 结果卡状态机：dict payload 携带截断/计数/动作信息
+                        self.status_var.set(payload.get("message", ""))
+                        self._show_result_card(payload)
+                        if payload.get("copy_ok"):
+                            self._flash_copy_button()
+                    else:  # 兼容纯字符串完成消息
+                        self.status_var.set(payload)
                     self._append_log("")
                 elif kind == "tray":
                     if payload == "open":
@@ -480,6 +942,31 @@ class DropWindow:
         self.log_text.insert("end", line + "\n")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
+        if line:  # 空行仅作日志分隔，不覆盖抽屉行
+            self.latest_log_var.set(f"{time.strftime('%H:%M')} {line}")
+
+    # ── 视觉细节 ──
+
+    def _tint_titlebar(self):
+        """DWM 标题栏着成 PINE 色（Win11/部分 Win10）；失败静默，不影响功能。
+
+        COLORREF 布局为 0x00BBGGRR，与 #RRGGBB 的字节序相反，需换算。
+        """
+        try:
+            hwnd = user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                return
+            r = int(theme.PINE[1:3], 16)
+            g = int(theme.PINE[3:5], 16)
+            b = int(theme.PINE[5:7], 16)
+            color = ctypes.c_uint((b << 16) | (g << 8) | r)
+            dwmapi = ctypes.windll.dwmapi
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                ctypes.wintypes.HWND, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.HRESULT
+            dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(color), 4)  # DWMWA_CAPTION_COLOR
+        except Exception:
+            logger.debug("标题栏着色不可用（DwmSetWindowAttribute 失败或系统不支持）")
 
     def run(self):
         self.root.mainloop()
