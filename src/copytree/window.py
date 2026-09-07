@@ -75,6 +75,18 @@ _FORMAT_LABELS = {
 
 _FORMAT_VALUE_TO_LABEL = {value: label for label, value in _FORMAT_LABELS.items()}
 
+# 安装状态横幅的按钮规格：状态 → (按钮文本, 动作键)。
+# 状态字符串与 __main__ 的 _INSTALL_STATE_* 常量保持契约一致——本模块禁止
+# import __main__（它延迟导入 window，会循环导入），状态以普通字符串参数传入。
+# downgrade 的按钮是"卸载"性质，走 uninstall 动作键（由 __main__ 装配注入）。
+_BANNER_BUTTONS = {
+    "not-installed": ("安装右键菜单", "not-installed"),
+    "update": (f"更新到 v{VERSION}", "update"),
+    "downgrade": ("卸载已装副本…", "uninstall"),
+    "repair": ("重新安装", "repair"),
+    "migrate": ("迁移到标准位置", "migrate"),
+}
+
 
 def _initial_ui_values(config: dict) -> dict:
     """UI 控件初始值取自配置，保证窗口入口与右键入口默认行为一致。"""
@@ -87,7 +99,16 @@ def _initial_ui_values(config: dict) -> dict:
 
 
 class DropWindow:
-    def __init__(self):
+    def __init__(self, install_state="ok", install_info=None, install_actions=None):
+        # 安装状态上下文（与 __main__ 的 _INSTALL_STATE_* 字符串契约一致）：
+        # install_actions 值为无参 callable，返回 bool 表示成功，成功后横幅自毁；
+        # _install_actions 是同一 dict 的运行时别名，_on_install_action 按此读取
+        self.install_state = install_state
+        self.install_info = install_info
+        self.install_actions = install_actions if install_actions is not None else {}
+        self._install_actions = self.install_actions
+        self._banner_frame = None
+
         self.root = tk.Tk()
         self.root.title(f"copy-tree v{VERSION} — 拖入文件夹即可复制目录树")
         self.root.minsize(520, 460)
@@ -111,6 +132,8 @@ class DropWindow:
 
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill="both", expand=True)
+
+        self._build_status_banner(top)
 
         list_frame = ttk.Frame(top)
         list_frame.pack(fill="both", expand=True)
@@ -172,6 +195,50 @@ class DropWindow:
 
         self.status_var = tk.StringVar(value="就绪。拖入文件夹或点击「添加文件夹」开始。")
         ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(6, 2)).pack(fill="x", side="bottom")
+
+    def _build_status_banner(self, parent):
+        """按安装状态在列表区上方渲染提示横幅；ok 态不创建任何控件。
+
+        install_actions 未注入对应动作键时不渲染按钮（只提示）。
+        """
+        if self.install_state == "ok":
+            return
+        info = self.install_info or {}
+        if self.install_state == "not-installed":
+            text = "尚未安装右键菜单，安装后可右键文件夹一键复制目录树。"
+        elif self.install_state == "update":
+            text = f"检测到新版本 v{VERSION}，已安装副本为旧版 v{info.get('installed_version', '?')}。"
+        elif self.install_state == "downgrade":
+            text = f"本机已安装更新版本 v{info.get('installed_version', '?')}（当前运行 v{VERSION}），右键菜单不受影响。"
+        elif self.install_state == "repair":
+            text = "安装副本丢失或损坏，重新安装后右键菜单恢复可用。"
+        elif self.install_state == "migrate":
+            text = "检测到旧安装路径，迁移到标准位置后更稳定。"
+        else:  # 未知状态不渲染，避免空白横幅
+            return
+        self._banner_frame = ttk.Frame(parent)
+        self._banner_frame.pack(fill="x")
+        ttk.Label(self._banner_frame, text=text).pack(side="left")
+        button_spec = _BANNER_BUTTONS.get(self.install_state)
+        if button_spec is not None:
+            button_text, action_key = button_spec
+            if action_key in self._install_actions:
+                ttk.Button(
+                    self._banner_frame, text=button_text,
+                    command=lambda key=action_key: self._on_install_action(key),
+                ).pack(side="left", padx=(8, 0))
+
+    def _on_install_action(self, key: str):
+        """执行注入的安装动作；成功后横幅自毁，失败保留横幅供重试。
+
+        卸载类回调可能不返回（进程即将退出），无需特殊处理。
+        """
+        action = self._install_actions.get(key)
+        if action is None:
+            return
+        if action() and self._banner_frame is not None:
+            self._banner_frame.destroy()
+            self._banner_frame = None
 
     # ── 原生拖拽 ──
 
@@ -424,9 +491,13 @@ _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
 )
 
 
-def run_drop_window() -> None:
+def run_drop_window(install_state="ok", install_info=None, install_actions=None) -> None:
     """打开拖拽窗口并阻塞至窗口关闭。仅在 GUI 主程序中使用。"""
-    app = DropWindow()
+    app = DropWindow(
+        install_state=install_state,
+        install_info=install_info,
+        install_actions=install_actions,
+    )
     try:
         app.run()
     finally:
