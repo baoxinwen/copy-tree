@@ -318,7 +318,7 @@ class ManageInstallFromGuiTests(unittest.TestCase):
     SOURCE = _SOURCE_EXE
 
     def run_manage(self, *, state, info=None, dismissed=False, confirm_result=True,
-                   install_ok=True, notify_mode=False):
+                   install_ok=True, update_ok=True, notify_mode=False):
         """统一桩式：执行 cli._manage_install_from_gui()，返回全部 mock 供断言。"""
         if info is None:
             info = {"installed_exe_path": "", "installed_version": ""}
@@ -339,7 +339,7 @@ class ManageInstallFromGuiTests(unittest.TestCase):
             cli, "_install_from_source", return_value=install_ok))
         ns.notify = stack.enter_context(mock.patch.object(cli, "_notify"))
         ns.update = stack.enter_context(mock.patch.object(
-            cli, "update_config_values", return_value=True))
+            cli, "update_config_values", return_value=update_ok))
         ns.open_window = stack.enter_context(mock.patch.object(
             cli, "_open_drop_window", return_value=None))
         if notify_mode:
@@ -410,6 +410,19 @@ class ManageInstallFromGuiTests(unittest.TestCase):
             cli._INSTALL_STATE_NOT_INSTALLED,
             {"installed_exe_path": "", "installed_version": ""},
         )
+
+    def test_prompt_decline_write_failure_logs_warning(self):
+        # 标记写失败（update 返回 False）时行为不变：仍开窗，
+        # 但必须留一条警告日志便于排查「下次双击又问了一次」
+        with mock.patch.object(cli.logger, "warning") as warn:
+            ns = self.run_manage(state=cli._INSTALL_STATE_NOT_INSTALLED,
+                                 confirm_result=False, update_ok=False)
+        ns.update.assert_called_once_with({"installPromptDismissed": True})
+        ns.open_window.assert_called_once_with(
+            cli._INSTALL_STATE_NOT_INSTALLED,
+            {"installed_exe_path": "", "installed_version": ""},
+        )
+        warn.assert_called_once()
 
     def test_prompt_skipped_when_dismissed(self):
         ns = self.run_manage(state=cli._INSTALL_STATE_NOT_INSTALLED, dismissed=True)
@@ -545,12 +558,22 @@ class OpenDropWindowTests(unittest.TestCase):
         ns.install.assert_called_once_with(self.SOURCE)
 
     def test_migrate_action_cancelled_returns_false_without_install(self):
-        # 取消或选择卸载都不动安装：回调返回 False，横幅保留
-        for choice in (cli._SETUP_ACTION_CANCEL, cli._SETUP_ACTION_UNINSTALL):
-            with self.subTest(choice=choice):
-                ns = self.open_window(migrate_choice=choice, install_ok=True)
-                self.assertIs(ns.actions["migrate"](), False)
-                ns.install.assert_not_called()
+        # 取消不动安装：回调返回 False，横幅保留
+        ns = self.open_window(migrate_choice=cli._SETUP_ACTION_CANCEL,
+                              install_ok=True)
+        self.assertIs(ns.actions["migrate"](), False)
+        ns.install.assert_not_called()
+
+    def test_migrate_action_uninstall_choice_runs_uninstall(self):
+        # 「否：卸载 copy-tree」接回现有卸载流程（与 uninstall 键回调同路，
+        # 正常完成返回 True；失败时内部 _exit(3) 自然不返回），且不触发安装
+        ns = self.open_window(migrate_choice=cli._SETUP_ACTION_UNINSTALL,
+                              install_ok=True, patch_uninstall=True)
+        self.assertIs(ns.actions["migrate"](), True)
+        ns.migrate.assert_called_once_with(
+            self.LEGACY_INFO["installed_exe_path"], cli.INSTALL_EXE)
+        ns.uninstall.assert_called_once_with(self.LEGACY_INFO["installed_exe_path"])
+        ns.install.assert_not_called()
 
     def test_uninstall_action_uses_existing_uninstall_path(self):
         # 卸载回调复用现有流程（成功后返回 True；失败时内部 _exit(3) 不返回）

@@ -750,7 +750,9 @@ def _manage_install_from_gui():
                 # state 保持 not-installed：窗口横幅仍提供重试入口
                 _notify("安装失败")
         else:
-            update_config_values({"installPromptDismissed": True})
+            if not update_config_values({"installPromptDismissed": True}):
+                # 写失败意味着下次双击会再次询问：留痕便于排查
+                logger.warning("无法写入 installPromptDismissed 标记 {}", CONFIG_FILE)
     _open_drop_window(state, info)
 
 
@@ -771,8 +773,13 @@ def _open_drop_window(install_state: str, install_info: dict) -> None:
 
     def _migrate_action() -> bool:
         # 迁移会改写安装位置，用户点按钮后仍确认一次（用户主动触发的弹窗）；
-        # 取消或选择卸载都不动安装，横幅保留可重试
-        if _choose_migrate_or_uninstall(installed_exe_path, INSTALL_EXE) != _SETUP_ACTION_INSTALL:
+        # 选「否：卸载」接回现有卸载流程（失败时内部 _exit(3)，可能不返回）；
+        # 取消不动安装，横幅保留可重试
+        choice = _choose_migrate_or_uninstall(installed_exe_path, INSTALL_EXE)
+        if choice == _SETUP_ACTION_UNINSTALL:
+            _uninstall_from_gui(installed_exe_path)
+            return True
+        if choice != _SETUP_ACTION_INSTALL:
             return False
         return _install_from_source(source_exe_path)
 
