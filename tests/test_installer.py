@@ -247,12 +247,25 @@ class AttachParentConsoleFallbackTests(unittest.TestCase):
         self.assertFalse(cli._stdio_ready)
 
 
+def _assert_open_args_accepted(recorded):
+    """契约校验：生产代码传给 open 的实参换 os.devnull 必须能被真实 open 打开。
+
+    防止 mock 把 ValueError（closefd=False + 文件名之类参数错误）整个遮住，
+    导致死代码照样绿灯。
+    """
+    for _, args, kwargs in recorded:
+        with open(os.devnull, *args, **kwargs) as probe:
+            if probe.closed:
+                raise AssertionError("真实 open 打开的探针流不应立即关闭")
+
+
 class AttachParentConsoleBackfillTests(unittest.TestCase):
     """_has_console() 命中但标准句柄无效时，须回填 CONOUT$/CONERR$ 流。
 
     GUI 子系统可执行文件即使附着了控制台，sys.stdout/sys.stderr 也可能为
     None；旧行为只置 _stdio_ready 不接流，下游（loguru stderr sink 等）拿
-    到的仍是空流。
+    到的仍是空流。GetStdHandle 在此分支不可达（_has_console 先短路），故
+    不再打那颗死桩。
     """
 
     def setUp(self):
@@ -260,26 +273,28 @@ class AttachParentConsoleBackfillTests(unittest.TestCase):
         self.addCleanup(setattr, cli, "_stdio_ready", False)
 
     def test_console_with_invalid_handles_backfills_streams(self):
-        fake_out, fake_err = mock.Mock(name="stdout"), mock.Mock(name="stderr")
+        # 契约式验证：记录传给 open 的实参，再用真实 open 证明参数组合可接受
+        recorded = []
+
+        def recording_open(file, *args, **kwargs):
+            recorded.append((file, args, kwargs))
+            return mock.Mock(name="stream")
+
         with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0x1001), \
-             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
              mock.patch.object(cli, "_launched_from_explorer", return_value=False), \
              mock.patch.object(cli.sys, "stdout", None), \
              mock.patch.object(cli.sys, "stderr", None), \
-             mock.patch("builtins.open", side_effect=[fake_out, fake_err]) as open_mock:
+             mock.patch("builtins.open", side_effect=recording_open):
             result = cli._attach_parent_console()
             self.assertTrue(result)
-            self.assertIs(cli.sys.stdout, fake_out)
-            self.assertIs(cli.sys.stderr, fake_err)
-        opened = [c.args[0] for c in open_mock.call_args_list]
-        self.assertEqual(opened, ["CONOUT$", "CONERR$"])
+            self.assertEqual([f for f, _, _ in recorded], ["CONOUT$", "CONERR$"])
+        _assert_open_args_accepted(recorded)
         self.assertTrue(cli._stdio_ready)
 
     def test_console_with_valid_streams_leaves_them_untouched(self):
         # 已有流（如重定向管道）不得被 CONOUT$ 覆盖，保住重定向语义
         keeper_out, keeper_err = object(), object()
         with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0x1001), \
-             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
              mock.patch.object(cli, "_launched_from_explorer", return_value=False), \
              mock.patch.object(cli.sys, "stdout", keeper_out), \
              mock.patch.object(cli.sys, "stderr", keeper_err), \
@@ -294,7 +309,6 @@ class AttachParentConsoleBackfillTests(unittest.TestCase):
     def test_backfill_open_failure_does_not_raise(self):
         # 依赖失败边界：控制台设备打不开时仍不抛异常，控制台在即视为就绪
         with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0x1001), \
-             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
              mock.patch.object(cli, "_launched_from_explorer", return_value=False), \
              mock.patch.object(cli.sys, "stdout", None), \
              mock.patch.object(cli.sys, "stderr", None), \
@@ -306,6 +320,53 @@ class AttachParentConsoleBackfillTests(unittest.TestCase):
         self.assertIsNone(out_during)
         self.assertIsNone(err_during)
         self.assertTrue(cli._stdio_ready)
+
+
+class AttachConsoleStreamTests(unittest.TestCase):
+    """AttachConsole 分支接流契约（修复 v1.0.0 起 closefd=False 致 open 必抛的死代码）。
+
+    AttachConsole 成功后必须真实接通 CONOUT$/CONERR$；任一 open 失败时不得
+    误置 _stdio_ready（时序约束：置 True 只能跟在成功的 open 之后）。
+    """
+
+    def setUp(self):
+        cli._stdio_ready = False
+        self.addCleanup(setattr, cli, "_stdio_ready", False)
+
+    def test_attach_console_success_opens_streams_with_valid_args(self):
+        recorded = []
+
+        def recording_open(file, *args, **kwargs):
+            recorded.append((file, args, kwargs))
+            return mock.Mock(name="stream")
+
+        with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0), \
+             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
+             mock.patch.object(cli.kernel32, "AttachConsole", return_value=1), \
+             mock.patch.object(cli, "_launched_from_explorer", return_value=False), \
+             mock.patch.object(cli.sys, "stdout", None), \
+             mock.patch.object(cli.sys, "stderr", None), \
+             mock.patch("builtins.open", side_effect=recording_open):
+            result = cli._attach_parent_console()
+            self.assertTrue(result)
+            self.assertEqual([f for f, _, _ in recorded], ["CONOUT$", "CONERR$"])
+        _assert_open_args_accepted(recorded)
+        self.assertTrue(cli._stdio_ready)
+
+    def test_attach_console_open_failure_keeps_stdio_not_ready(self):
+        # 异常被吞后不得误报就绪：AttachConsole 成功但流打不开 → 返回 False
+        with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0), \
+             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
+             mock.patch.object(cli.kernel32, "AttachConsole", return_value=1), \
+             mock.patch.object(cli, "_launched_from_explorer", return_value=False), \
+             mock.patch.object(cli.sys, "stdout", None), \
+             mock.patch.object(cli.sys, "stderr", None), \
+             mock.patch("builtins.open", side_effect=OSError("no console device")):
+            result = cli._attach_parent_console()
+            out_during = cli.sys.stdout
+        self.assertFalse(result)
+        self.assertFalse(cli._stdio_ready)
+        self.assertIsNone(out_during)
 
 
 class ManageInstallFromGuiTests(unittest.TestCase):
@@ -591,10 +652,11 @@ class OpenDropWindowTests(unittest.TestCase):
 
 
 class InstallDialogCharacterizationTests(unittest.TestCase):
-    """Task 3 遗留 Minor：弹窗函数特征测试——锁定按钮 ID → 返回值映射。
+    """弹窗函数特征测试——锁定按钮 ID → 返回值映射。
 
     只测映射不测文案；_show_question_box 打桩后 MessageBoxW 永不被真实调用。
-    这些函数如今被窗口横幅回调消费，属回归护栏。
+    生产路径现仅消费 _confirm_install 与 _choose_migrate_or_uninstall；
+    其余五个暂无生产调用点，按 spec 6.2 作为特征测试保留，防映射漂移。
     """
 
     def ask(self, func, button_id, *args):

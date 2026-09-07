@@ -137,9 +137,9 @@ def _attach_parent_console() -> bool:
         # 流；已存在的流（如重定向管道）保持原样，不破坏重定向语义
         try:
             if sys.stdout is None:
-                sys.stdout = open("CONOUT$", "w", encoding="utf-8", closefd=False)
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8")
             if sys.stderr is None:
-                sys.stderr = open("CONERR$", "w", encoding="utf-8", closefd=False)
+                sys.stderr = open("CONERR$", "w", encoding="utf-8")
         except Exception:
             pass
         _stdio_ready = True
@@ -155,8 +155,8 @@ def _attach_parent_console() -> bool:
         return True
     try:
         if kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
-            sys.stdout = open("CONOUT$", "w", encoding="utf-8", closefd=False)
-            sys.stderr = open("CONERR$", "w", encoding="utf-8", closefd=False)
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8")
+            sys.stderr = open("CONERR$", "w", encoding="utf-8")
             _stdio_ready = True
             return True
     except Exception:
