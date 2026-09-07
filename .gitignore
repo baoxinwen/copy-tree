@@ -32,6 +32,10 @@ ENV/
 .vscode/
 .idea/
 
+# Skill execution workspaces (SDD scratch + linked worktrees)
+.superpowers/
+.worktrees/
+
 # OS
 .DS_Store
 Thumbs.db
