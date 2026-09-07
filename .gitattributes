@@ -1,0 +1,11 @@
+# Normalize all text files to LF on check-in and check-out.
+* text=auto eol=lf
+
+# Windows binaries — never touch line endings or content.
+*.ico binary
+*.exe binary
+*.dll binary
+*.png binary
+
+# Linguist: PyInstaller spec files are Python syntax.
+*.spec linguist-language=Python
