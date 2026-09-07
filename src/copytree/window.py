@@ -213,7 +213,7 @@ class DropWindow:
         elif self.install_state == "repair":
             text = "安装副本丢失或损坏，重新安装后右键菜单恢复可用。"
         elif self.install_state == "migrate":
-            text = "检测到旧安装路径，迁移到标准位置后更稳定。"
+            text = "检测到旧安装路径，迁移到标准位置后右键菜单不再依赖下载目录。"
         else:  # 未知状态不渲染，避免空白横幅
             return
         self._banner_frame = ttk.Frame(parent)

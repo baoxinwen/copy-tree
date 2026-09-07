@@ -1022,7 +1022,7 @@ def _show_question_box(text: str, buttons: int) -> int:
 
 def _confirm_install() -> bool:
     result = _show_question_box(
-        f"是否安装 copy-tree 右键菜单？\n\n程序会安装到：\n{INSTALL_EXE}",
+        f"是否安装 copy-tree 右键菜单？\n\n安装后可右键任意文件夹一键复制目录树。\n安装位置：\n{INSTALL_EXE}\n\n（可随时在拖拽窗口或开始菜单卸载）",
         MB_YESNO,
     )
     return result == IDYES
@@ -1063,7 +1063,7 @@ def _choose_downgrade_or_uninstall(source_path: str, target_path: str, installed
 
 def _choose_migrate_or_uninstall(old_path: str, new_path: str) -> int:
     result = _show_question_box(
-        f"检测到 copy-tree 使用旧安装路径：\n{old_path}\n\n请选择操作：\n是：迁移到稳定安装位置\n否：卸载 copy-tree\n取消：不做更改\n\n新的安装位置：\n{new_path}",
+        f"检测到 copy-tree 使用旧安装路径：\n{old_path}\n\n请选择操作：\n是：迁移到标准安装位置\n否：卸载 copy-tree\n取消：不做更改\n\n新的安装位置：\n{new_path}",
         MB_YESNOCANCEL,
     )
     if result == IDYES:
