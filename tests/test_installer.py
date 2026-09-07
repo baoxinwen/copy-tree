@@ -47,10 +47,14 @@ class ComputeInstallStateTests(unittest.TestCase):
         self.assertEqual(info["installed_version"], "1.0.0")
 
     def test_state_ok_when_same_version_registered(self):
-        state, info = self.compute(installed_path=cli.INSTALL_EXE, version="1.1.0")
+        # purity 锁：状态计算不得弹窗；若未来回归引入弹窗，
+        # 先在 patch 阶段挂起/报错，而不是卡住测试进程
+        with mock.patch.object(cli, "_show_question_box") as question_box:
+            state, info = self.compute(installed_path=cli.INSTALL_EXE, version="1.1.0")
         self.assertEqual(state, cli._INSTALL_STATE_OK)
         self.assertEqual(info["installed_exe_path"], cli.INSTALL_EXE)
         self.assertEqual(info["installed_version"], "1.1.0")
+        question_box.assert_not_called()
 
     def test_state_downgrade_when_running_older(self):
         state, info = self.compute(installed_path=cli.INSTALL_EXE, version="99.0")
@@ -81,11 +85,20 @@ class ComputeInstallStateTests(unittest.TestCase):
         self.assertEqual(info, {"installed_exe_path": "", "installed_version": ""})
 
     def test_same_version_byte_differs_is_ok(self):
-        # F5 拍板：同版本不做任何字节比对，字节差异也视为正常
-        with mock.patch.object(cli, "_files_match", return_value=False) as files_match:
-            state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="1.1.0",
-                                    files_match=False)
+        # F5 拍板：同版本不做任何字节比对，字节差异也视为正常。
+        # 刻意不走 self.compute：辅助方法内部还会 patch _files_match，
+        # 嵌套后外层 mock 被遮蔽，assert_not_called 恒真、锁失效；
+        # 这里单层 patch + 直接调用，保证检查作用于被测函数执行期。
+        with mock.patch.object(cli, "get_installed_exe_path", return_value=cli.INSTALL_EXE), \
+             mock.patch.object(cli, "get_installed_version", return_value="1.1.0"), \
+             mock.patch.object(cli, "is_registered", return_value=True), \
+             mock.patch.object(cli, "_same_path", return_value=True), \
+             mock.patch.object(cli.os.path, "isfile", return_value=True), \
+             mock.patch.object(cli, "VERSION", "1.1.0"), \
+             mock.patch.object(cli, "_files_match", return_value=False) as files_match:
+            state, info = cli._compute_install_state(r"C:\run\copy-tree.exe")
         self.assertEqual(state, cli._INSTALL_STATE_OK)
+        self.assertEqual(info["installed_version"], "1.1.0")
         files_match.assert_not_called()
 
     def test_no_version_record_same_bytes_is_ok(self):
@@ -116,11 +129,9 @@ class ComputeInstallStateTests(unittest.TestCase):
         state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="1.0.0rc")
         self.assertEqual(state, cli._INSTALL_STATE_UPDATE)
 
-    def test_empty_version_string_behaves_as_unrecorded(self):
-        # 空版本串为假值：不得进入版本比较，按未登记走字节比对
-        state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="",
-                                files_match=True)
-        self.assertEqual(state, cli._INSTALL_STATE_OK)
+    # 说明：原 test_empty_version_string_behaves_as_unrecorded 与
+    # test_no_version_record_same_bytes_is_ok 输入完全重复（空版本串为假值、
+    # 走字节比对路径），评审后删除；空版本语义由该用例继续锁定。
 
     def test_missing_target_check_oserror_propagates(self):
         # 依赖失败边界：isfile 抛 OSError 时现状冒泡，锁定不加吞咽
