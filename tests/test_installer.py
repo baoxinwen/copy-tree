@@ -1,13 +1,21 @@
+import contextlib
 import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from copytree import __main__ as cli  # noqa: E402
+from copytree import window as window_module  # noqa: E402
+
+# Win32 MessageBoxW「取消」按钮标准值；winapi.py 只导出了 IDYES/IDNO
+IDCANCEL = 2
+
+_SOURCE_EXE = r"C:\run\copy-tree.exe"
 
 
 class VersionOrderingTests(unittest.TestCase):
@@ -298,6 +306,343 @@ class AttachParentConsoleBackfillTests(unittest.TestCase):
         self.assertIsNone(out_during)
         self.assertIsNone(err_during)
         self.assertTrue(cli._stdio_ready)
+
+
+class ManageInstallFromGuiTests(unittest.TestCase):
+    """no-args 主流程重接线（Task 5）：算状态 → 可选首次引导 → 带状态开窗。
+
+    桩式遵循 Task 3 教训：所有依赖在一个 ExitStack 里单层并行 patch，
+    断言用的 mock 与注入被测函数的是同一实例，严禁嵌套 patch 遮蔽。
+    """
+
+    SOURCE = _SOURCE_EXE
+
+    def run_manage(self, *, state, info=None, dismissed=False, confirm_result=True,
+                   install_ok=True, notify_mode=False):
+        """统一桩式：执行 cli._manage_install_from_gui()，返回全部 mock 供断言。"""
+        if info is None:
+            info = {"installed_exe_path": "", "installed_version": ""}
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        ns = SimpleNamespace()
+        ns.info = info
+        ns.exe = stack.enter_context(mock.patch.object(
+            cli, "_get_exe_path", return_value=self.SOURCE))
+        ns.compute = stack.enter_context(mock.patch.object(
+            cli, "_compute_install_state", return_value=(state, info)))
+        ns.config = stack.enter_context(mock.patch.object(
+            cli, "get_effective_config",
+            return_value={"installPromptDismissed": dismissed}))
+        ns.confirm = stack.enter_context(mock.patch.object(
+            cli, "_confirm_install", return_value=confirm_result))
+        ns.install = stack.enter_context(mock.patch.object(
+            cli, "_install_from_source", return_value=install_ok))
+        ns.notify = stack.enter_context(mock.patch.object(cli, "_notify"))
+        ns.update = stack.enter_context(mock.patch.object(
+            cli, "update_config_values", return_value=True))
+        ns.open_window = stack.enter_context(mock.patch.object(
+            cli, "_open_drop_window", return_value=None))
+        if notify_mode:
+            self.addCleanup(setattr, cli, "_force_notify_mode", False)
+            cli._force_notify_mode = True
+        cli._manage_install_from_gui()
+        return ns
+
+    def test_no_args_opens_window_with_computed_state(self):
+        # 任意状态都开窗且参数原样透传；非 not-installed 态不得弹首次引导
+        states = [
+            (cli._INSTALL_STATE_NOT_INSTALLED,
+             {"installed_exe_path": "", "installed_version": ""}),
+            (cli._INSTALL_STATE_OK,
+             {"installed_exe_path": cli.INSTALL_EXE, "installed_version": "1.1.0"}),
+            (cli._INSTALL_STATE_UPDATE,
+             {"installed_exe_path": cli.INSTALL_EXE, "installed_version": "1.0.0"}),
+            (cli._INSTALL_STATE_DOWNGRADE,
+             {"installed_exe_path": cli.INSTALL_EXE, "installed_version": "99.0"}),
+            (cli._INSTALL_STATE_REPAIR,
+             {"installed_exe_path": cli.INSTALL_EXE, "installed_version": ""}),
+            (cli._INSTALL_STATE_MIGRATE,
+             {"installed_exe_path": r"D:\legacy\copy-tree.exe",
+              "installed_version": "1.0.0"}),
+        ]
+        for state, info in states:
+            with self.subTest(state=state):
+                ns = self.run_manage(state=state, info=info, dismissed=True)
+                ns.open_window.assert_called_once_with(state, info)
+                if state != cli._INSTALL_STATE_NOT_INSTALLED:
+                    ns.confirm.assert_not_called()
+
+    def test_first_run_prompt_shown_when_not_installed_and_not_dismissed(self):
+        ns = self.run_manage(state=cli._INSTALL_STATE_NOT_INSTALLED, dismissed=False)
+        ns.confirm.assert_called_once_with()
+        ns.compute.assert_called_once_with(self.SOURCE)
+
+    def test_prompt_accept_installs_then_opens_ok_window(self):
+        ns = self.run_manage(state=cli._INSTALL_STATE_NOT_INSTALLED,
+                             confirm_result=True, install_ok=True)
+        ns.install.assert_called_once_with(self.SOURCE)
+        ns.notify.assert_called_once_with(cli.MSG_INSTALLED)
+        ns.open_window.assert_called_once_with(
+            cli._INSTALL_STATE_OK,
+            {"installed_exe_path": cli.INSTALL_EXE, "installed_version": cli.VERSION},
+        )
+        ns.update.assert_not_called()
+
+    def test_prompt_accept_install_failure_keeps_not_installed_window(self):
+        # 安装失败：通知失败但 state 保持 not-installed（横幅可重试），
+        # 且不写 dismiss 标记（下次双击仍可再次询问）
+        ns = self.run_manage(state=cli._INSTALL_STATE_NOT_INSTALLED,
+                             confirm_result=True, install_ok=False)
+        ns.notify.assert_called_once_with("安装失败")
+        ns.open_window.assert_called_once_with(
+            cli._INSTALL_STATE_NOT_INSTALLED,
+            {"installed_exe_path": "", "installed_version": ""},
+        )
+        ns.update.assert_not_called()
+
+    def test_prompt_decline_persists_flag_and_still_opens_window(self):
+        ns = self.run_manage(state=cli._INSTALL_STATE_NOT_INSTALLED,
+                             confirm_result=False)
+        ns.update.assert_called_once_with({"installPromptDismissed": True})
+        ns.install.assert_not_called()
+        ns.notify.assert_not_called()
+        ns.open_window.assert_called_once_with(
+            cli._INSTALL_STATE_NOT_INSTALLED,
+            {"installed_exe_path": "", "installed_version": ""},
+        )
+
+    def test_prompt_skipped_when_dismissed(self):
+        ns = self.run_manage(state=cli._INSTALL_STATE_NOT_INSTALLED, dismissed=True)
+        ns.confirm.assert_not_called()
+        ns.install.assert_not_called()
+        ns.update.assert_not_called()
+        ns.open_window.assert_called_once_with(
+            cli._INSTALL_STATE_NOT_INSTALLED,
+            {"installed_exe_path": "", "installed_version": ""},
+        )
+
+    def test_notify_mode_bypasses_window(self):
+        # 回归红线：--notify 全程不开窗——_manage_install_from_gui 直接返回，
+        # 不算状态、不弹引导、不开窗（调用点锁定在 _handle_no_args）
+        ns = self.run_manage(state=cli._INSTALL_STATE_OK, notify_mode=True)
+        ns.compute.assert_not_called()
+        ns.confirm.assert_not_called()
+        ns.open_window.assert_not_called()
+
+
+class MainFlagDispatchTests(unittest.TestCase):
+    """回归红线：--install/--uninstall 参数通路行为不变（Task 5 只重接 no-args）。"""
+
+    def run_main(self, argv):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(
+            cli.sys, "argv", ["copy-tree.exe"] + argv))
+        # 非 frozen 环境默认按 CLI 入口处理；显式钉成 GUI exe 才能走到安装分发
+        stack.enter_context(mock.patch.object(
+            cli, "_is_cli_executable", return_value=False))
+        stack.enter_context(mock.patch.object(
+            cli, "_attach_parent_console", return_value=False))
+        stack.enter_context(mock.patch.object(
+            cli, "_launched_from_explorer", return_value=False))
+        stack.enter_context(mock.patch.object(cli, "setup_logging"))
+        stack.enter_context(mock.patch.object(cli, "_pause_if_double_clicked_cli"))
+        ns = SimpleNamespace()
+        ns.exit = stack.enter_context(mock.patch.object(cli, "_exit"))
+        ns.install = stack.enter_context(mock.patch.object(cli, "_handle_install"))
+        ns.uninstall = stack.enter_context(mock.patch.object(cli, "_handle_uninstall"))
+        cli.main()
+        return ns
+
+    def test_install_flag_dispatches_to_install_handler(self):
+        ns = self.run_main(["--install"])
+        ns.install.assert_called_once_with()
+        ns.uninstall.assert_not_called()
+        ns.exit.assert_not_called()
+
+    def test_uninstall_flag_dispatches_to_uninstall_handler(self):
+        ns = self.run_main(["--uninstall"])
+        ns.uninstall.assert_called_once_with()
+        ns.install.assert_not_called()
+        ns.exit.assert_not_called()
+
+
+class OpenDropWindowTests(unittest.TestCase):
+    """_open_drop_window（Task 5）：回调装配 + 三参透传 + tkinter 初始化失败兜底。
+
+    回调键契约取窗口侧实际查找的并集：window._BANNER_BUTTONS 按状态查
+    not-installed/update/repair/migrate/uninstall（downgrade 固定绑 uninstall），
+    另附协调口径中的 install 键作别名，多余键窗口永不读取。
+    """
+
+    SOURCE = _SOURCE_EXE
+    LEGACY_INFO = {"installed_exe_path": r"D:\legacy\copy-tree.exe",
+                   "installed_version": "1.0.0"}
+
+    def open_window(self, state="update", info=None, run_side_effect=None,
+                    install_ok=None, migrate_choice=None, patch_uninstall=False,
+                    expect_failure=False):
+        if info is None:
+            info = dict(self.LEGACY_INFO)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        ns = SimpleNamespace()
+        ns.info = info
+        stack.enter_context(mock.patch.object(
+            cli, "_get_exe_path", return_value=self.SOURCE))
+        ns.run = stack.enter_context(mock.patch.object(
+            window_module, "run_drop_window", side_effect=run_side_effect))
+        ns.install = ns.migrate = ns.uninstall = None
+        if install_ok is not None:
+            ns.install = stack.enter_context(mock.patch.object(
+                cli, "_install_from_source", return_value=install_ok))
+        if migrate_choice is not None:
+            ns.migrate = stack.enter_context(mock.patch.object(
+                cli, "_choose_migrate_or_uninstall", return_value=migrate_choice))
+        if patch_uninstall:
+            ns.uninstall = stack.enter_context(mock.patch.object(
+                cli, "_uninstall_from_gui"))
+        if expect_failure:
+            ns.report = stack.enter_context(mock.patch.object(
+                cli, "_report_setup_status"))
+            ns.exit = stack.enter_context(mock.patch.object(cli, "_exit"))
+        cli._open_drop_window(state, info)
+        ns.actions = ns.run.call_args.kwargs["install_actions"]
+        return ns
+
+    def test_forwards_state_info_and_action_dict(self):
+        info = dict(self.LEGACY_INFO)
+        ns = self.open_window("repair", info=info)
+        ns.run.assert_called_once()
+        self.assertEqual(ns.run.call_args.kwargs["install_state"], "repair")
+        self.assertIs(ns.run.call_args.kwargs["install_info"], info)
+        expected_keys = {"install", "update", "repair", "migrate", "uninstall",
+                         "not-installed"}
+        self.assertTrue(expected_keys.issubset(ns.actions))
+        for key in expected_keys:
+            self.assertTrue(callable(ns.actions[key]), key)
+
+    def test_install_family_keys_call_install_from_source(self):
+        # install/update/repair/not-installed 四个键都路由到 _install_from_source
+        for key in ("install", "update", "repair", "not-installed"):
+            with self.subTest(key=key):
+                ns = self.open_window(install_ok=True)
+                self.assertIs(ns.actions[key](), True)
+                ns.install.assert_called_once_with(self.SOURCE)
+
+    def test_install_action_failure_returns_false(self):
+        # 失败返回 False：窗口横幅保留供重试
+        ns = self.open_window(install_ok=False)
+        self.assertIs(ns.actions["update"](), False)
+        ns.install.assert_called_once_with(self.SOURCE)
+
+    def test_migrate_action_confirmed_then_installs(self):
+        ns = self.open_window(migrate_choice=cli._SETUP_ACTION_INSTALL,
+                              install_ok=True)
+        self.assertIs(ns.actions["migrate"](), True)
+        ns.migrate.assert_called_once_with(
+            self.LEGACY_INFO["installed_exe_path"], cli.INSTALL_EXE)
+        ns.install.assert_called_once_with(self.SOURCE)
+
+    def test_migrate_action_cancelled_returns_false_without_install(self):
+        # 取消或选择卸载都不动安装：回调返回 False，横幅保留
+        for choice in (cli._SETUP_ACTION_CANCEL, cli._SETUP_ACTION_UNINSTALL):
+            with self.subTest(choice=choice):
+                ns = self.open_window(migrate_choice=choice, install_ok=True)
+                self.assertIs(ns.actions["migrate"](), False)
+                ns.install.assert_not_called()
+
+    def test_uninstall_action_uses_existing_uninstall_path(self):
+        # 卸载回调复用现有流程（成功后返回 True；失败时内部 _exit(3) 不返回）
+        ns = self.open_window(patch_uninstall=True)
+        self.assertIs(ns.actions["uninstall"](), True)
+        ns.uninstall.assert_called_once_with(self.LEGACY_INFO["installed_exe_path"])
+
+    def test_window_init_failure_reports_and_exits_3(self):
+        # tkinter 初始化失败（tk.Tk() 抛异常等）：报告状态并按失败惯例 _exit(3)
+        ns = self.open_window(run_side_effect=RuntimeError("tk init failed"),
+                              expect_failure=True)
+        ns.report.assert_called_once()
+        self.assertIn("无法打开窗口", ns.report.call_args.args[0])
+        ns.exit.assert_called_once_with(3)
+
+
+class InstallDialogCharacterizationTests(unittest.TestCase):
+    """Task 3 遗留 Minor：弹窗函数特征测试——锁定按钮 ID → 返回值映射。
+
+    只测映射不测文案；_show_question_box 打桩后 MessageBoxW 永不被真实调用。
+    这些函数如今被窗口横幅回调消费，属回归护栏。
+    """
+
+    def ask(self, func, button_id, *args):
+        with mock.patch.object(cli, "_show_question_box", return_value=button_id) as box:
+            result = func(*args)
+        box.assert_called_once()
+        return result
+
+    def test_confirm_install_mapping(self):
+        self.assertIs(self.ask(cli._confirm_install, cli.IDYES), True)
+        self.assertIs(self.ask(cli._confirm_install, cli.IDNO), False)
+
+    def test_confirm_uninstall_mapping(self):
+        self.assertIs(self.ask(cli._confirm_uninstall, cli.IDYES), True)
+        self.assertIs(self.ask(cli._confirm_uninstall, cli.IDNO), False)
+
+    def test_choose_uninstall_or_keep_mapping(self):
+        path = r"C:\installed\copy-tree.exe"
+        self.assertEqual(
+            self.ask(cli._choose_uninstall_or_keep, cli.IDYES, path),
+            cli._SETUP_ACTION_UNINSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_uninstall_or_keep, cli.IDNO, path),
+            cli._SETUP_ACTION_CANCEL)
+
+    def test_choose_update_or_uninstall_mapping(self):
+        args = (r"C:\run\copy-tree.exe", r"C:\installed\copy-tree.exe", "1.0.0")
+        self.assertEqual(
+            self.ask(cli._choose_update_or_uninstall, cli.IDYES, *args),
+            cli._SETUP_ACTION_INSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_update_or_uninstall, cli.IDNO, *args),
+            cli._SETUP_ACTION_UNINSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_update_or_uninstall, IDCANCEL, *args),
+            cli._SETUP_ACTION_CANCEL)
+
+    def test_choose_downgrade_or_uninstall_mapping(self):
+        args = (r"C:\run\copy-tree.exe", r"C:\installed\copy-tree.exe", "99.0")
+        self.assertEqual(
+            self.ask(cli._choose_downgrade_or_uninstall, cli.IDYES, *args),
+            cli._SETUP_ACTION_INSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_downgrade_or_uninstall, cli.IDNO, *args),
+            cli._SETUP_ACTION_UNINSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_downgrade_or_uninstall, IDCANCEL, *args),
+            cli._SETUP_ACTION_CANCEL)
+
+    def test_choose_migrate_or_uninstall_mapping(self):
+        args = (r"D:\legacy\copy-tree.exe", r"C:\installed\copy-tree.exe")
+        self.assertEqual(
+            self.ask(cli._choose_migrate_or_uninstall, cli.IDYES, *args),
+            cli._SETUP_ACTION_INSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_migrate_or_uninstall, cli.IDNO, *args),
+            cli._SETUP_ACTION_UNINSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_migrate_or_uninstall, IDCANCEL, *args),
+            cli._SETUP_ACTION_CANCEL)
+
+    def test_choose_repair_or_uninstall_mapping(self):
+        self.assertEqual(
+            self.ask(cli._choose_repair_or_uninstall, cli.IDYES, r"C:\gone\copy-tree.exe"),
+            cli._SETUP_ACTION_INSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_repair_or_uninstall, cli.IDNO, r"C:\gone\copy-tree.exe"),
+            cli._SETUP_ACTION_UNINSTALL)
+        self.assertEqual(
+            self.ask(cli._choose_repair_or_uninstall, IDCANCEL, r"C:\gone\copy-tree.exe"),
+            cli._SETUP_ACTION_CANCEL)
 
 
 if __name__ == "__main__":

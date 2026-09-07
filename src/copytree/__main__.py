@@ -12,7 +12,11 @@ import sys
 from loguru import logger
 
 from .clipboard import copy_to_clipboard, get_last_failure_stage
-from .config import get_config_warnings, get_effective_config
+from .config import (
+    get_config_warnings,
+    get_effective_config,
+    update_config_values,
+)
 from .constants import (
     CONFIG_FILE,
     DEFAULT_OUTPUT_FILENAME_JSON,
@@ -38,7 +42,6 @@ from .notify import show_notification, wait_notification
 from .registry import (
     get_installed_exe_path,
     get_installed_version,
-    get_registered_command,
     install,
     is_registered,
     uninstall,
@@ -717,62 +720,87 @@ def _check_config():
 
 
 def _manage_install_from_gui():
+    if _force_notify_mode:
+        # --notify 是右键复制流程注入的隐藏参数：该模式只允许气泡通知，
+        # 绝不进入安装管理/开窗流程（回归红线）
+        logger.debug("--notify 通知模式：跳过安装管理，不开窗")
+        return
     source_exe_path = _get_exe_path()
     state, info = _compute_install_state(source_exe_path)
-    installed_exe_path = info["installed_exe_path"]
     logger.debug(
         "安装管理入口 source='{}' state='{}' registered_target='{}'",
-        source_exe_path, state, installed_exe_path,
+        source_exe_path, state, info["installed_exe_path"],
     )
 
-    if state == _INSTALL_STATE_OK:
-        # 同版本（或字节相同）双击不弹任何询问：直接打开拖拽窗口；
-        # 卸载入口在窗口内和开始菜单「卸载 copy-tree」快捷方式
-        logger.info("已安装同版本 {}，打开拖拽窗口", info["installed_version"])
+    if (
+        state == _INSTALL_STATE_NOT_INSTALLED
+        and not get_effective_config().get("installPromptDismissed")
+    ):
+        # 首次引导只在真正未安装且用户未拒绝过时出现一次；
+        # 拒绝后写标记，之后每次双击都安静地直接开窗
+        if _confirm_install():
+            if _install_from_source(source_exe_path):
+                _notify(MSG_INSTALLED)
+                state = _INSTALL_STATE_OK
+                info = {
+                    "installed_exe_path": INSTALL_EXE,
+                    "installed_version": VERSION,
+                }
+            else:
+                # state 保持 not-installed：窗口横幅仍提供重试入口
+                _notify("安装失败")
+        else:
+            update_config_values({"installPromptDismissed": True})
+    _open_drop_window(state, info)
+
+
+def _open_drop_window(install_state: str, install_info: dict) -> None:
+    """装配安装动作回调并按状态打开拖拽窗口；阻塞至窗口关闭。
+
+    回调契约与 window.DropWindow 一致：无参 callable，返回 bool 表示成功，
+    成功(True)后横幅自毁，False 保留供重试；用户在弹窗里取消同样算 False。
+    键取两侧契约的并集：window._BANNER_BUTTONS 按状态查
+    not-installed/update/repair/migrate/uninstall（downgrade 固定绑 uninstall），
+    另附 install 键作别名——窗口不会读取多余键。
+    """
+    source_exe_path = _get_exe_path()
+    installed_exe_path = install_info.get("installed_exe_path", "") if install_info else ""
+
+    def _install_action() -> bool:
+        return _install_from_source(source_exe_path)
+
+    def _migrate_action() -> bool:
+        # 迁移会改写安装位置，用户点按钮后仍确认一次（用户主动触发的弹窗）；
+        # 取消或选择卸载都不动安装，横幅保留可重试
+        if _choose_migrate_or_uninstall(installed_exe_path, INSTALL_EXE) != _SETUP_ACTION_INSTALL:
+            return False
+        return _install_from_source(source_exe_path)
+
+    def _uninstall_action() -> bool:
+        # 复用现有卸载流程：失败时内部直接 _exit(3)，可能不返回
+        _uninstall_from_gui(installed_exe_path)
+        return True
+
+    actions = {
+        "install": _install_action,
+        "update": _install_action,
+        "repair": _install_action,
+        "not-installed": _install_action,
+        "migrate": _migrate_action,
+        "uninstall": _uninstall_action,
+    }
+    try:
+        # 延迟导入：window 依赖 tkinter，缺失/损坏时走下面的兜底而不是崩在 import
         from .window import run_drop_window
 
-        run_drop_window()
-        _exit(0)
-
-    if state == _INSTALL_STATE_NOT_INSTALLED:
-        if not _confirm_install():
-            _exit(0)
-        if _install_from_source(source_exe_path):
-            _notify(MSG_INSTALLED)
-        else:
-            _notify("安装失败")
-            _exit(3)
-        return
-
-    # 以下状态暂沿用原弹窗询问（Task 5 将整体改为拖拽窗口按钮驱动）。
-    if state == _INSTALL_STATE_DOWNGRADE:
-        action = _choose_downgrade_or_uninstall(
-            source_exe_path, INSTALL_EXE, info["installed_version"]
+        run_drop_window(
+            install_state=install_state,
+            install_info=install_info,
+            install_actions=actions,
         )
-    elif state == _INSTALL_STATE_UPDATE:
-        action = _choose_update_or_uninstall(
-            source_exe_path, INSTALL_EXE, info["installed_version"]
-        )
-    elif state == _INSTALL_STATE_MIGRATE:
-        action = _choose_migrate_or_uninstall(installed_exe_path, INSTALL_EXE)
-    else:  # _INSTALL_STATE_REPAIR
-        if not installed_exe_path:
-            # 菜单键已注册但命令无法解析出主程序路径：按残留菜单提供修复/卸载，
-            # 而不是把它当成未安装直接走全新安装确认。
-            logger.warning("菜单已注册但命令无法解析，进入残留修复分支")
-        action = _choose_repair_or_uninstall(
-            installed_exe_path or get_registered_command() or "(无法解析)"
-        )
-
-    if action == _SETUP_ACTION_CANCEL:
-        _exit(0)
-    if action == _SETUP_ACTION_UNINSTALL:
-        _uninstall_from_gui(installed_exe_path)
-        return
-    if _install_from_source(source_exe_path):
-        _notify(MSG_INSTALLED)
-    else:
-        _notify("安装失败")
+    except Exception as e:
+        logger.exception("拖拽窗口打开失败 state='{}'", install_state)
+        _report_setup_status(f"无法打开窗口：{e}")
         _exit(3)
 
 
