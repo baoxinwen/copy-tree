@@ -131,6 +131,15 @@ def _attach_parent_console() -> bool:
     if _launched_from_explorer():
         return False
     if _has_console():
+        # GUI 子系统常见：控制台在而标准句柄未初始化，从控制台设备回填空缺
+        # 流；已存在的流（如重定向管道）保持原样，不破坏重定向语义
+        try:
+            if sys.stdout is None:
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8", closefd=False)
+            if sys.stderr is None:
+                sys.stderr = open("CONERR$", "w", encoding="utf-8", closefd=False)
+        except Exception:
+            pass
         _stdio_ready = True
         return True
     stdout = _open_std_stream(STD_OUTPUT_HANDLE)

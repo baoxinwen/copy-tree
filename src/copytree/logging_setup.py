@@ -42,7 +42,8 @@ def setup_logging(enable_stderr: bool = False) -> None:
         )
     except OSError:
         # 文件不可写时退化为仅 stderr 最小配置，保证程序继续可用
-        logger.add(sys.stderr, level="WARNING", format=_STDERR_FORMAT)
+        if sys.stderr is not None:
+            logger.add(sys.stderr, level="WARNING", format=_STDERR_FORMAT)
         return
-    if enable_stderr:
+    if enable_stderr and sys.stderr is not None:
         logger.add(sys.stderr, level="WARNING", format=_STDERR_FORMAT)

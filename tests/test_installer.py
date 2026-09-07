@@ -174,5 +174,100 @@ def _cleanup_dir(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
+class AttachParentConsoleFallbackTests(unittest.TestCase):
+    """_attach_parent_console 无控制台场景特征测试（此前零覆盖）。
+
+    锁定现状：无控制台窗口、标准句柄无效、AttachConsole 失败时，
+    必须安静地返回 False 且不触碰任何标准流。
+    """
+
+    def setUp(self):
+        cli._stdio_ready = False
+        self.addCleanup(setattr, cli, "_stdio_ready", False)
+
+    def test_no_console_and_no_handles_returns_false(self):
+        # 控制台 API 全部返回失败：GetConsoleWindow=0、句柄无效、AttachConsole=0
+        with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0), \
+             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=cli.INVALID_HANDLE_VALUE), \
+             mock.patch.object(cli.kernel32, "AttachConsole", return_value=0), \
+             mock.patch.object(cli, "_launched_from_explorer", return_value=False):
+            result = cli._attach_parent_console()
+
+        self.assertFalse(result)
+        self.assertFalse(cli._stdio_ready)
+
+    def test_zero_handle_is_also_invalid(self):
+        # 空输入边界：句柄值 0 同样视为无效，不得尝试打开流
+        with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0), \
+             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
+             mock.patch.object(cli.kernel32, "AttachConsole", return_value=0), \
+             mock.patch.object(cli, "_launched_from_explorer", return_value=False):
+            result = cli._attach_parent_console()
+
+        self.assertFalse(result)
+        self.assertFalse(cli._stdio_ready)
+
+
+class AttachParentConsoleBackfillTests(unittest.TestCase):
+    """_has_console() 命中但标准句柄无效时，须回填 CONOUT$/CONERR$ 流。
+
+    GUI 子系统可执行文件即使附着了控制台，sys.stdout/sys.stderr 也可能为
+    None；旧行为只置 _stdio_ready 不接流，下游（loguru stderr sink 等）拿
+    到的仍是空流。
+    """
+
+    def setUp(self):
+        cli._stdio_ready = False
+        self.addCleanup(setattr, cli, "_stdio_ready", False)
+
+    def test_console_with_invalid_handles_backfills_streams(self):
+        fake_out, fake_err = mock.Mock(name="stdout"), mock.Mock(name="stderr")
+        with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0x1001), \
+             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
+             mock.patch.object(cli, "_launched_from_explorer", return_value=False), \
+             mock.patch.object(cli.sys, "stdout", None), \
+             mock.patch.object(cli.sys, "stderr", None), \
+             mock.patch("builtins.open", side_effect=[fake_out, fake_err]) as open_mock:
+            result = cli._attach_parent_console()
+            self.assertTrue(result)
+            self.assertIs(cli.sys.stdout, fake_out)
+            self.assertIs(cli.sys.stderr, fake_err)
+        opened = [c.args[0] for c in open_mock.call_args_list]
+        self.assertEqual(opened, ["CONOUT$", "CONERR$"])
+        self.assertTrue(cli._stdio_ready)
+
+    def test_console_with_valid_streams_leaves_them_untouched(self):
+        # 已有流（如重定向管道）不得被 CONOUT$ 覆盖，保住重定向语义
+        keeper_out, keeper_err = object(), object()
+        with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0x1001), \
+             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
+             mock.patch.object(cli, "_launched_from_explorer", return_value=False), \
+             mock.patch.object(cli.sys, "stdout", keeper_out), \
+             mock.patch.object(cli.sys, "stderr", keeper_err), \
+             mock.patch("builtins.open") as open_mock:
+            result = cli._attach_parent_console()
+            self.assertTrue(result)
+            self.assertIs(cli.sys.stdout, keeper_out)
+            self.assertIs(cli.sys.stderr, keeper_err)
+        open_mock.assert_not_called()
+        self.assertTrue(cli._stdio_ready)
+
+    def test_backfill_open_failure_does_not_raise(self):
+        # 依赖失败边界：控制台设备打不开时仍不抛异常，控制台在即视为就绪
+        with mock.patch.object(cli.kernel32, "GetConsoleWindow", return_value=0x1001), \
+             mock.patch.object(cli.kernel32, "GetStdHandle", return_value=0), \
+             mock.patch.object(cli, "_launched_from_explorer", return_value=False), \
+             mock.patch.object(cli.sys, "stdout", None), \
+             mock.patch.object(cli.sys, "stderr", None), \
+             mock.patch("builtins.open", side_effect=OSError("no console device")):
+            result = cli._attach_parent_console()
+            out_during = cli.sys.stdout
+            err_during = cli.sys.stderr
+        self.assertTrue(result)
+        self.assertIsNone(out_during)
+        self.assertIsNone(err_during)
+        self.assertTrue(cli._stdio_ready)
+
+
 if __name__ == "__main__":
     unittest.main()
