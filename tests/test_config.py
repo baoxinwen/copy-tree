@@ -1,4 +1,5 @@
 import sys
+import json
 import shutil
 import unittest
 from pathlib import Path
@@ -7,7 +8,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from copytree import config as config_module  # noqa: E402
-from copytree.config import _merge, get_config_warnings, load_config  # noqa: E402
+from copytree.config import (  # noqa: E402
+    _merge,
+    get_config_warnings,
+    get_effective_config,
+    load_config,
+    update_config_values,
+)
 
 from loguru import logger as _quiet_logger  # noqa: E402
 
@@ -98,6 +105,74 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config["filterExt"], sorted(SOURCE_CODE_EXTENSIONS))
         self.assertTrue(any("filterExt" in warning for warning in warnings))
+
+    def test_install_prompt_dismissed_defaults_false(self):
+        original_config_file = config_module.CONFIG_FILE
+        tmp = Path("test_runtime_config_prompt")
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir()
+        try:
+            config_module.CONFIG_FILE = str(tmp / "copy-tree.json")
+            try:
+                cfg = get_effective_config({})
+            finally:
+                config_module.CONFIG_FILE = original_config_file
+        finally:
+            if tmp.exists():
+                shutil.rmtree(tmp)
+
+        self.assertIs(False, cfg["installPromptDismissed"])
+
+    def test_install_prompt_dismissed_invalid_type_falls_back(self):
+        original_config_file = config_module.CONFIG_FILE
+        tmp = Path("test_runtime_config_prompt_invalid")
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir()
+        try:
+            config_file = tmp / "copy-tree.json"
+            config_file.write_text(
+                '{"installPromptDismissed": "yes"}',
+                encoding="utf-8",
+            )
+            config_module.CONFIG_FILE = str(config_file)
+            try:
+                cfg = get_effective_config({})
+                warnings = get_config_warnings()
+            finally:
+                config_module.CONFIG_FILE = original_config_file
+        finally:
+            if tmp.exists():
+                shutil.rmtree(tmp)
+
+        self.assertIs(False, cfg["installPromptDismissed"])
+        self.assertTrue(any("installPromptDismissed" in warning for warning in warnings))
+
+    def test_update_config_values_persists_dismiss_flag(self):
+        original_config_file = config_module.CONFIG_FILE
+        original_config_dir = config_module.CONFIG_DIR
+        tmp = Path("test_runtime_config_prompt_update")
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir()
+        try:
+            config_file = tmp / "copy-tree.json"
+            config_module.CONFIG_FILE = str(config_file)
+            config_module.CONFIG_DIR = str(tmp)
+            try:
+                updated = update_config_values({"installPromptDismissed": True})
+                doc = json.loads(config_file.read_text("utf-8-sig"))
+            finally:
+                config_module.CONFIG_FILE = original_config_file
+                config_module.CONFIG_DIR = original_config_dir
+        finally:
+            if tmp.exists():
+                shutil.rmtree(tmp)
+
+        self.assertTrue(updated)
+        self.assertTrue(doc["installPromptDismissed"])
+        self.assertIn("__installPromptDismissed说明", doc)
 
 
 if __name__ == "__main__":

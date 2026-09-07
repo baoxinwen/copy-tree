@@ -28,6 +28,7 @@ _DEFAULTS = {
     "showFileTime": False,
     "respectGitignore": False,
     "enableTray": False,
+    "installPromptDismissed": False,
     "filterExt": sorted(SOURCE_CODE_EXTENSIONS),
 }
 
@@ -47,6 +48,7 @@ _COMMENTS = {
     "__showFileTime说明": "是否默认显示修改时间。true 显示，false 不显示。右键菜单有专门的「含修改时间」选项。",
     "__respectGitignore说明": "扫描时是否遵循目录中的 .gitignore 规则过滤。true 遵循，false 忽略。右键菜单有专门的「遵循 .gitignore」选项。",
     "__enableTray说明": "拖拽窗口关闭时是否驻留系统托盘（不常驻后台的默认选择是 false）。",
+    "__installPromptDismissed说明": "首次使用引导中用户选择“暂不安装”后，是否不再弹出安装询问（true 后仍可随时在拖拽窗口安装）。",
     "__filterExt说明": "按后缀筛选文件的扩展名列表。用于右键菜单「仅指定后缀文件」功能。可自定义，例如只看图片就填 [\".png\", \".jpg\", \".svg\"]。",
 }
 
@@ -90,6 +92,7 @@ def load_config() -> dict:
         "showFileTime": bool,
         "respectGitignore": bool,
         "enableTray": bool,
+        "installPromptDismissed": bool,
         "filterExt": list,
     }
     for key, expected_type in schema.items():
@@ -192,6 +195,8 @@ def _validation_warning(key: str, _value) -> str:
         return "respectGitignore 必须是 true 或 false，当前值已忽略"
     if key == "enableTray":
         return "enableTray 必须是 true 或 false，当前值已忽略"
+    if key == "installPromptDismissed":
+        return "installPromptDismissed 必须是 true 或 false，当前值已忽略"
     return f"{key} 的值无效，当前值已忽略"
 
 
@@ -223,6 +228,8 @@ def ensure_config_file() -> str:
         doc["__respectGitignore说明"] = _COMMENTS["__respectGitignore说明"]
         doc["enableTray"] = False
         doc["__enableTray说明"] = _COMMENTS["__enableTray说明"]
+        doc["installPromptDismissed"] = False
+        doc["__installPromptDismissed说明"] = _COMMENTS["__installPromptDismissed说明"]
         doc["filterExt"] = sorted(SOURCE_CODE_EXTENSIONS)
         doc["__filterExt说明"] = _COMMENTS["__filterExt说明"]
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
