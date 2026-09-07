@@ -20,30 +20,126 @@ class VersionOrderingTests(unittest.TestCase):
         self.assertFalse(cli._is_version_newer("0.9", "1.0"))
 
 
-class ChooseInstalledActionTests(unittest.TestCase):
-    def test_downgrade_uses_honest_dialog(self):
-        # 安装副本版本比当前文件新 → 属降级，弹窗必须如实说明而非"检测到新版"
-        with mock.patch.object(cli, "get_installed_version", return_value="99.0"), \
+class ComputeInstallStateTests(unittest.TestCase):
+    """_compute_install_state 六态矩阵（Task 3）：纯计算，无弹窗、无副作用。
+
+    判定规则逐分支平移自原 _choose_installed_action，另有 F5 拍板：
+    同版本（或字节相同）一律 ok，不再触发任何询问分支。
+    """
+
+    def compute(self, *, installed_path="", version="", menu_registered=False,
+                stable=True, install_exe_exists=True, files_match=True,
+                running_version="1.1.0"):
+        """统一桩式：installed_path 为注册表解析出的目标，stable 为其与
+        INSTALL_EXE 同路径，menu_registered 为菜单键是否残留。"""
+        with mock.patch.object(cli, "get_installed_exe_path", return_value=installed_path), \
+             mock.patch.object(cli, "get_installed_version", return_value=version), \
+             mock.patch.object(cli, "is_registered", return_value=menu_registered), \
+             mock.patch.object(cli, "_same_path", return_value=stable), \
+             mock.patch.object(cli.os.path, "isfile", return_value=install_exe_exists), \
+             mock.patch.object(cli, "_files_match", return_value=files_match), \
+             mock.patch.object(cli, "VERSION", running_version):
+            return cli._compute_install_state(r"C:\run\copy-tree.exe")
+
+    def test_state_update_when_running_newer(self):
+        state, info = self.compute(installed_path=cli.INSTALL_EXE, version="1.0.0")
+        self.assertEqual(state, cli._INSTALL_STATE_UPDATE)
+        self.assertEqual(info["installed_version"], "1.0.0")
+
+    def test_state_ok_when_same_version_registered(self):
+        state, info = self.compute(installed_path=cli.INSTALL_EXE, version="1.1.0")
+        self.assertEqual(state, cli._INSTALL_STATE_OK)
+        self.assertEqual(info["installed_exe_path"], cli.INSTALL_EXE)
+        self.assertEqual(info["installed_version"], "1.1.0")
+
+    def test_state_downgrade_when_running_older(self):
+        state, info = self.compute(installed_path=cli.INSTALL_EXE, version="99.0")
+        self.assertEqual(state, cli._INSTALL_STATE_DOWNGRADE)
+        self.assertEqual(info["installed_version"], "99.0")
+
+    def test_state_repair_when_target_missing(self):
+        state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="1.0.0",
+                                install_exe_exists=False)
+        self.assertEqual(state, cli._INSTALL_STATE_REPAIR)
+
+    def test_state_repair_when_menu_orphan(self):
+        # 菜单键在但命令解析不出主程序路径：残留菜单按修复处理
+        state, info = self.compute(installed_path="", menu_registered=True)
+        self.assertEqual(state, cli._INSTALL_STATE_REPAIR)
+        self.assertEqual(info["installed_exe_path"], "")
+
+    def test_state_migrate_when_legacy_path(self):
+        legacy = r"D:\legacy\copy-tree.exe"
+        state, info = self.compute(installed_path=legacy, stable=False)
+        self.assertEqual(state, cli._INSTALL_STATE_MIGRATE)
+        self.assertEqual(info["installed_exe_path"], legacy)
+
+    def test_state_not_installed_when_no_registry(self):
+        state, info = self.compute(installed_path="", menu_registered=False)
+        self.assertEqual(state, cli._INSTALL_STATE_NOT_INSTALLED)
+        # 契约：未安装时两个键仍存在且为空串（不得为 None），Task 5 直接透传
+        self.assertEqual(info, {"installed_exe_path": "", "installed_version": ""})
+
+    def test_same_version_byte_differs_is_ok(self):
+        # F5 拍板：同版本不做任何字节比对，字节差异也视为正常
+        with mock.patch.object(cli, "_files_match", return_value=False) as files_match:
+            state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="1.1.0",
+                                    files_match=False)
+        self.assertEqual(state, cli._INSTALL_STATE_OK)
+        files_match.assert_not_called()
+
+    def test_no_version_record_same_bytes_is_ok(self):
+        # 旧版安装未登记版本：回退字节比对，相同 → ok（原"卸载/保留"询问退役）
+        state, info = self.compute(installed_path=cli.INSTALL_EXE, version="",
+                                   files_match=True)
+        self.assertEqual(state, cli._INSTALL_STATE_OK)
+        self.assertEqual(info["installed_version"], "")
+
+    def test_no_version_record_bytes_differ_is_update(self):
+        state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="",
+                                files_match=False)
+        self.assertEqual(state, cli._INSTALL_STATE_UPDATE)
+
+    def test_no_version_record_target_missing_is_repair(self):
+        state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="",
+                                install_exe_exists=False)
+        self.assertEqual(state, cli._INSTALL_STATE_REPAIR)
+
+    def test_legacy_target_missing_is_repair(self):
+        # 非标准路径且旧文件已消失：无处可迁移，只能修复
+        state, _ = self.compute(installed_path=r"D:\legacy\copy-tree.exe",
+                                stable=False, install_exe_exists=False)
+        self.assertEqual(state, cli._INSTALL_STATE_REPAIR)
+
+    def test_version_with_non_numeric_segment_is_update(self):
+        # 极值输入：非数字段按 _version_key 语义取 0，"1.0.0rc" < "1.1.0" → update
+        state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="1.0.0rc")
+        self.assertEqual(state, cli._INSTALL_STATE_UPDATE)
+
+    def test_empty_version_string_behaves_as_unrecorded(self):
+        # 空版本串为假值：不得进入版本比较，按未登记走字节比对
+        state, _ = self.compute(installed_path=cli.INSTALL_EXE, version="",
+                                files_match=True)
+        self.assertEqual(state, cli._INSTALL_STATE_OK)
+
+    def test_missing_target_check_oserror_propagates(self):
+        # 依赖失败边界：isfile 抛 OSError 时现状冒泡，锁定不加吞咽
+        with mock.patch.object(cli, "get_installed_exe_path", return_value=cli.INSTALL_EXE), \
+             mock.patch.object(cli, "get_installed_version", return_value="1.0.0"), \
              mock.patch.object(cli, "_same_path", return_value=True), \
-             mock.patch.object(cli.os.path, "isfile", return_value=True), \
-             mock.patch.object(cli, "_show_question_box", return_value=cli.IDYES) as box:
-            action = cli._choose_installed_action("C:\\run\\copy-tree.exe", cli.INSTALL_EXE)
+             mock.patch.object(cli, "VERSION", "1.1.0"), \
+             mock.patch.object(cli.os.path, "isfile", side_effect=OSError("disk error")):
+            self.assertRaises(OSError, cli._compute_install_state, r"C:\run\copy-tree.exe")
 
-        self.assertEqual(action, cli._SETUP_ACTION_INSTALL)
-        text = box.call_args[0][0]
-        self.assertIn("降级", text)
-        self.assertNotIn("检测到新版", text)
-
-    def test_upgrade_keeps_update_dialog(self):
-        with mock.patch.object(cli, "get_installed_version", return_value="0.0.1"), \
-             mock.patch.object(cli, "_same_path", return_value=True), \
-             mock.patch.object(cli.os.path, "isfile", return_value=True), \
-             mock.patch.object(cli, "_show_question_box", return_value=cli.IDYES) as box:
-            action = cli._choose_installed_action("C:\\run\\copy-tree.exe", cli.INSTALL_EXE)
-
-        self.assertEqual(action, cli._SETUP_ACTION_INSTALL)
-        text = box.call_args[0][0]
-        self.assertIn("检测到新版", text)
+    def test_info_dict_contract_exact_keys(self):
+        # 契约：info 恰好两个键，长路径/版本原样透传，供窗口展示
+        state, info = self.compute(installed_path=cli.INSTALL_EXE, version="1.0.0")
+        self.assertEqual(
+            info,
+            {"installed_exe_path": cli.INSTALL_EXE, "installed_version": "1.0.0"},
+        )
+        self.assertIn(state, ("update", "ok", "downgrade", "repair", "migrate",
+                              "not-installed"))
 
 
 class UninstallNoticeTests(unittest.TestCase):
@@ -58,82 +154,6 @@ class UninstallNoticeTests(unittest.TestCase):
         with mock.patch.object(cli.os.path, "exists", return_value=False):
             notice = cli._uninstall_notice()
         self.assertEqual(notice, cli.MSG_UNINSTALLED)
-
-
-class DecisionTreeTests(unittest.TestCase):
-    """_choose_installed_action 七分支特征测试（评审 I-7：安装决策树零覆盖）。
-
-    锁定现状：各前置状态到弹窗/动作的路由语义，防止后续改动无声漂移。
-    """
-
-    def decide(self, *, version="", same_stable=False, same_running=False,
-               install_exe_exists=False, files_match=False,
-               confirm=True, box_result=None):
-        box_result = cli.IDYES if box_result is None else box_result
-        with mock.patch.object(cli, "get_installed_version", return_value=version), \
-             mock.patch.object(cli, "_same_path", side_effect=[same_stable, same_running]), \
-             mock.patch.object(cli.os.path, "isfile", return_value=install_exe_exists), \
-             mock.patch.object(cli, "_files_match", return_value=files_match), \
-             mock.patch.object(cli, "_confirm_uninstall", return_value=confirm), \
-             mock.patch.object(cli, "_show_question_box", return_value=box_result) as box:
-            action = cli._choose_installed_action(r"C:\run\copy-tree.exe", cli.INSTALL_EXE)
-        return action, box
-
-    def test_same_version_reports_uptodate_without_dialog(self):
-        action, box = self.decide(version=cli.VERSION, same_stable=True)
-        self.assertEqual(action, cli._SETUP_ACTION_UPTODATE)
-        box.assert_not_called()
-
-    def test_registered_and_running_without_version_asks_uninstall(self):
-        action, _ = self.decide(same_stable=True, same_running=True, confirm=True)
-        self.assertEqual(action, cli._SETUP_ACTION_UNINSTALL)
-        action, _ = self.decide(same_stable=True, same_running=True, confirm=False)
-        self.assertEqual(action, cli._SETUP_ACTION_CANCEL)
-
-    def test_registered_files_match_offers_uninstall_or_keep(self):
-        action, _ = self.decide(same_stable=True, install_exe_exists=True,
-                                files_match=True, box_result=cli.IDNO)
-        self.assertEqual(action, cli._SETUP_ACTION_CANCEL)
-        action, _ = self.decide(same_stable=True, install_exe_exists=True,
-                                files_match=True, box_result=cli.IDYES)
-        self.assertEqual(action, cli._SETUP_ACTION_UNINSTALL)
-
-    def test_registered_files_differ_falls_back_to_update_dialog(self):
-        # 空版本号（旧版安装）时回退 filecmp 比对：不同 → 更新弹窗
-        action, _ = self.decide(same_stable=True, install_exe_exists=True,
-                                files_match=False, box_result=cli.IDYES)
-        self.assertEqual(action, cli._SETUP_ACTION_INSTALL)
-
-    def test_registered_but_target_missing_routes_to_repair(self):
-        action, _ = self.decide(same_stable=True, install_exe_exists=False,
-                                box_result=cli.IDYES)
-        self.assertEqual(action, cli._SETUP_ACTION_INSTALL)
-
-    def test_unregistered_with_existing_install_routes_to_migrate(self):
-        action, box = self.decide(same_stable=False, install_exe_exists=True,
-                                  box_result=cli.IDYES)
-        self.assertEqual(action, cli._SETUP_ACTION_INSTALL)
-        self.assertIn("旧安装路径", box.call_args[0][0])
-
-    def test_nothing_registered_and_missing_routes_to_repair(self):
-        # 空输入边界：installed_exe_path 为空串时不迁移，直接走修复
-        with mock.patch.object(cli, "get_installed_version", return_value=""), \
-             mock.patch.object(cli, "_same_path", side_effect=[False, False]), \
-             mock.patch.object(cli.os.path, "isfile", return_value=False), \
-             mock.patch.object(cli, "_show_question_box", return_value=cli.IDYES) as box:
-            action = cli._choose_installed_action(r"C:\run\copy-tree.exe", "")
-        self.assertEqual(action, cli._SETUP_ACTION_INSTALL)
-        self.assertIn("修复", box.call_args[0][0])
-
-    def test_dialog_cancel_is_preserved_everywhere(self):
-        for kwargs in (
-            {"same_stable": True, "same_running": True, "confirm": False},
-            {"same_stable": True, "install_exe_exists": True, "files_match": True,
-             "box_result": 2},
-            {"same_stable": False, "install_exe_exists": True, "box_result": 2},
-        ):
-            action, _ = self.decide(**kwargs)
-            self.assertEqual(action, cli._SETUP_ACTION_CANCEL)
 
 
 class FilesMatchTests(unittest.TestCase):

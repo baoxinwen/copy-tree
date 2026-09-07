@@ -67,7 +67,6 @@ from .winapi import (
 _SETUP_ACTION_CANCEL = 0
 _SETUP_ACTION_INSTALL = 1
 _SETUP_ACTION_UNINSTALL = 2
-_SETUP_ACTION_UPTODATE = 3
 _stdio_ready = False
 _parent_process_name: str | None = None
 _parent_process_names: list[str] | None = None
@@ -719,50 +718,57 @@ def _check_config():
 
 def _manage_install_from_gui():
     source_exe_path = _get_exe_path()
-    installed_exe_path = get_installed_exe_path()
-    logger.debug("安装管理入口 source='{}' registered_target='{}'", source_exe_path, installed_exe_path)
+    state, info = _compute_install_state(source_exe_path)
+    installed_exe_path = info["installed_exe_path"]
+    logger.debug(
+        "安装管理入口 source='{}' state='{}' registered_target='{}'",
+        source_exe_path, state, installed_exe_path,
+    )
 
-    if installed_exe_path:
-        action = _choose_installed_action(source_exe_path, installed_exe_path)
-        if action == _SETUP_ACTION_CANCEL:
-            _exit(0)
-        if action == _SETUP_ACTION_UPTODATE:
-            # 同版本双击不弹任何询问：直接打开拖拽窗口；
-            # 卸载入口在窗口内和开始菜单「卸载 copy-tree」快捷方式
-            logger.info("已安装同版本 {}，打开拖拽窗口", get_installed_version())
-            from .window import run_drop_window
+    if state == _INSTALL_STATE_OK:
+        # 同版本（或字节相同）双击不弹任何询问：直接打开拖拽窗口；
+        # 卸载入口在窗口内和开始菜单「卸载 copy-tree」快捷方式
+        logger.info("已安装同版本 {}，打开拖拽窗口", info["installed_version"])
+        from .window import run_drop_window
 
-            run_drop_window()
-            _exit(0)
-        if action == _SETUP_ACTION_UNINSTALL:
-            _uninstall_from_gui(installed_exe_path)
-            return
-        if _install_from_source(source_exe_path):
-            _notify(MSG_INSTALLED)
-        else:
-            _notify("安装失败")
-            _exit(3)
-        return
-
-    if is_registered():
-        # 菜单键已注册但命令无法解析出主程序路径：按残留菜单提供修复/卸载，
-        # 而不是把它当成未安装直接走全新安装确认。
-        logger.warning("菜单已注册但命令无法解析，进入残留修复分支")
-        action = _choose_repair_or_uninstall(get_registered_command() or "(无法解析)")
-        if action == _SETUP_ACTION_CANCEL:
-            _exit(0)
-        if action == _SETUP_ACTION_UNINSTALL:
-            _uninstall_from_gui(installed_exe_path)
-            return
-        if _install_from_source(source_exe_path):
-            _notify(MSG_INSTALLED)
-        else:
-            _notify("安装失败")
-            _exit(3)
-        return
-
-    if not _confirm_install():
+        run_drop_window()
         _exit(0)
+
+    if state == _INSTALL_STATE_NOT_INSTALLED:
+        if not _confirm_install():
+            _exit(0)
+        if _install_from_source(source_exe_path):
+            _notify(MSG_INSTALLED)
+        else:
+            _notify("安装失败")
+            _exit(3)
+        return
+
+    # 以下状态暂沿用原弹窗询问（Task 5 将整体改为拖拽窗口按钮驱动）。
+    if state == _INSTALL_STATE_DOWNGRADE:
+        action = _choose_downgrade_or_uninstall(
+            source_exe_path, INSTALL_EXE, info["installed_version"]
+        )
+    elif state == _INSTALL_STATE_UPDATE:
+        action = _choose_update_or_uninstall(
+            source_exe_path, INSTALL_EXE, info["installed_version"]
+        )
+    elif state == _INSTALL_STATE_MIGRATE:
+        action = _choose_migrate_or_uninstall(installed_exe_path, INSTALL_EXE)
+    else:  # _INSTALL_STATE_REPAIR
+        if not installed_exe_path:
+            # 菜单键已注册但命令无法解析出主程序路径：按残留菜单提供修复/卸载，
+            # 而不是把它当成未安装直接走全新安装确认。
+            logger.warning("菜单已注册但命令无法解析，进入残留修复分支")
+        action = _choose_repair_or_uninstall(
+            installed_exe_path or get_registered_command() or "(无法解析)"
+        )
+
+    if action == _SETUP_ACTION_CANCEL:
+        _exit(0)
+    if action == _SETUP_ACTION_UNINSTALL:
+        _uninstall_from_gui(installed_exe_path)
+        return
     if _install_from_source(source_exe_path):
         _notify(MSG_INSTALLED)
     else:
@@ -784,39 +790,61 @@ def _is_version_newer(left: str, right: str) -> bool:
     return _version_key(left) > _version_key(right)
 
 
-def _choose_installed_action(source_exe_path: str, installed_exe_path: str) -> int:
-    registered_stable_copy = _same_path(installed_exe_path, INSTALL_EXE)
-    running_registered_copy = _same_path(source_exe_path, installed_exe_path)
+_INSTALL_STATE_NOT_INSTALLED = "not-installed"
+_INSTALL_STATE_OK = "ok"
+_INSTALL_STATE_UPDATE = "update"
+_INSTALL_STATE_DOWNGRADE = "downgrade"
+_INSTALL_STATE_REPAIR = "repair"
+_INSTALL_STATE_MIGRATE = "migrate"
+
+
+def _compute_install_state(source_exe_path: str) -> tuple[str, dict]:
+    """双击安装决策的六态纯计算：只判定，不弹窗、不写注册表、不改文件。
+
+    返回 (状态, 上下文)；上下文固定含 installed_exe_path / installed_version
+    两个键（未安装时为空串，不用 None），供调用方（弹窗流程或拖拽窗口）直接使用。
+    """
+    installed_exe_path = get_installed_exe_path()
     installed_version = get_installed_version()
 
-    # 优先按注册表版本判断，免去每次双击的全量字节比对；
-    # 注册表无版本值（旧版安装后未重装）时退回原有 filecmp 比对逻辑
+    if not installed_exe_path:
+        # 菜单键已注册但命令解析不出主程序路径：按残留菜单提供修复，而不是当成未安装
+        state = (
+            _INSTALL_STATE_REPAIR if is_registered() else _INSTALL_STATE_NOT_INSTALLED
+        )
+        return state, {"installed_exe_path": "", "installed_version": installed_version}
+
+    registered_stable_copy = _same_path(installed_exe_path, INSTALL_EXE)
+
     if installed_version and registered_stable_copy:
+        # 优先按注册表版本判断，免去每次双击的全量字节比对；
+        # 同版本即视为正常，不再做任何字节比对（F5）
         if installed_version == VERSION:
-            # 同版本：只轻提示不弹窗；卸载入口收敛到开始菜单「卸载 copy-tree」
-            return _SETUP_ACTION_UPTODATE
-        if os.path.isfile(INSTALL_EXE):
-            if _is_version_newer(installed_version, VERSION):
-                # 安装副本比当前文件新：属降级，弹窗如实说明，避免误导覆盖
-                return _choose_downgrade_or_uninstall(
-                    source_exe_path, INSTALL_EXE, installed_version
-                )
-            return _choose_update_or_uninstall(source_exe_path, INSTALL_EXE, installed_version)
-        return _choose_repair_or_uninstall(INSTALL_EXE)
-
-    if registered_stable_copy and running_registered_copy:
-        return _SETUP_ACTION_UNINSTALL if _confirm_uninstall() else _SETUP_ACTION_CANCEL
-
-    if registered_stable_copy:
+            state = _INSTALL_STATE_OK
+        elif not os.path.isfile(INSTALL_EXE):
+            state = _INSTALL_STATE_REPAIR
+        elif _is_version_newer(installed_version, VERSION):
+            # 安装副本比当前文件新：属降级
+            state = _INSTALL_STATE_DOWNGRADE
+        else:
+            state = _INSTALL_STATE_UPDATE
+    elif registered_stable_copy:
+        # 注册表无版本值（旧版安装后未重装）时退回字节比对
         if os.path.isfile(INSTALL_EXE) and _files_match(source_exe_path, INSTALL_EXE):
-            return _choose_uninstall_or_keep(INSTALL_EXE)
-        if os.path.isfile(INSTALL_EXE):
-            return _choose_update_or_uninstall(source_exe_path, INSTALL_EXE)
-        return _choose_repair_or_uninstall(INSTALL_EXE)
+            state = _INSTALL_STATE_OK
+        elif os.path.isfile(INSTALL_EXE):
+            state = _INSTALL_STATE_UPDATE
+        else:
+            state = _INSTALL_STATE_REPAIR
+    elif os.path.isfile(installed_exe_path):
+        state = _INSTALL_STATE_MIGRATE
+    else:
+        state = _INSTALL_STATE_REPAIR
 
-    if os.path.isfile(installed_exe_path):
-        return _choose_migrate_or_uninstall(installed_exe_path, INSTALL_EXE)
-    return _choose_repair_or_uninstall(installed_exe_path)
+    return state, {
+        "installed_exe_path": installed_exe_path,
+        "installed_version": installed_version,
+    }
 
 
 def _uninstall_from_gui(installed_exe_path: str):
