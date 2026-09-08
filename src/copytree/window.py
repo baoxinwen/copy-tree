@@ -150,6 +150,12 @@ class DropWindow:
         self._clear_after_id = None
         self._log_expanded = False
 
+        # 扫描状态层：显式「扫描」→ 每文件夹结果缓存 → 复制/保存/预览只消费缓存
+        self._scan_cache: dict[str, dict] = {}
+        self._scan_opts: dict | None = None
+        self._pending_scan_opts: dict | None = None
+        self._pending_auto_copy = False
+
         self._build_ui()
         self._install_drag_drop()
         self._tint_titlebar()
@@ -304,11 +310,15 @@ class DropWindow:
         ttk.Checkbutton(row, text="遵循 .gitignore", variable=self.gitignore_var,
                         style="ScanRow.TCheckbutton").pack(side="left", padx=(theme.PAD_ROW, 0))
         ttk.Checkbutton(row, text="仅源码文件", variable=self.source_only_var,
-                        style="ScanRow.TCheckbutton").pack(side="left", padx=(theme.PAD_ROW, 0))
+                        style="ScanRow.TCheckbutton",
+                        command=self._refresh_ready_card).pack(side="left", padx=(theme.PAD_ROW, 0))
         ttk.Frame(row, style="ScanRow.TFrame").pack(side="left", fill="both", expand=True)
         separator = tk.Frame(row, bg=theme.BORDER, width=1, height=16)
         separator.pack(side="left", fill="y", padx=(0, theme.PAD_ROW))
-        ttk.Button(row, text="添加文件夹…", command=self._add_folder_dialog).pack(side="left")
+        self.scan_button = ttk.Button(row, text="扫描", style="Primary.TButton",
+                                      command=self._on_scan)
+        self.scan_button.pack(side="left")
+        ttk.Button(row, text="添加文件夹…", command=self._add_folder_dialog).pack(side="left", padx=(theme.PAD_ROW, 0))
         self.clear_button = ttk.Button(row, text="清空全部", style="DangerGhost.TButton",
                                        command=self._on_clear_clicked)
         self.clear_button.pack(side="left", padx=(theme.PAD_ROW, 0))
@@ -338,6 +348,7 @@ class DropWindow:
         self.folder_tree.pack(side="left", fill="both", expand=True)
         self.folder_tree.bind("<Delete>", lambda _event: self._remove_selected())
         self.folder_tree.bind("<Button-1>", self._on_tree_click)
+        self.folder_tree.bind("<<TreeviewSelect>>", self._on_folder_selected)
 
     def _build_preview(self, parent):
         """预览区（兼任拖放目标提示）：头部说明 + 只读等宽文本。
@@ -480,14 +491,23 @@ class DropWindow:
             self.result_status.configure(style="ResultCard.TLabel")
 
     def _refresh_ready_card(self):
-        """就绪态：列表任何增删后立即回到此态，文件数按当前行实时重算。"""
+        """就绪态门卫：缓存有效 → 启用复制/保存并显示待复制数；
+        从未扫描或列表/选项变化 → 禁用并提示重新扫描。"""
         self.result_link.pack_forget()
         self._apply_card_style(warn=False)
-        if self.folder_tree.get_children():
+        if not self._cache_valid():
+            self.copy_button.config(state="disabled")
+            self.copy_button.config(state="disabled")
+            self.save_button.config(state="disabled")
             self.status_var.set(
-                f"共 {_fmt_count(self._sum_row_counts())} 个文件待复制，结果将写入剪贴板。")
-        else:
-            self.status_var.set("就绪。拖入文件夹或点击「添加文件夹」开始。")
+                "请先执行扫描。" if self._scan_opts is None
+                else "列表或选项已变化，请重新扫描。")
+            return
+        self._apply_card_style(warn=False)
+        self.copy_button.config(state="normal")
+        self.save_button.config(state="normal")
+        self.status_var.set(
+            f"共 {_fmt_count(self._sum_row_counts())} 个文件待复制，结果将写入剪贴板。")
 
     def _show_result_card(self, payload: dict):
         """操作结果态：copy/save 完成后由 _poll 调用；任一文件夹截断切警告态。"""
@@ -615,8 +635,8 @@ class DropWindow:
         if dropped_dirs:
             self._refresh_ready_card()
             if self.auto_copy_var.get():
-                # 「拖入后自动复制」：拖入文件夹后触发一次复制
-                self._on_copy()
+                # 拖入后自动复制：缓存有效直接复制，否则先扫描，scan_done 续跑复制
+                self._start_scan_after_drop()
 
     # ── 动作 ──
 
@@ -631,17 +651,6 @@ class DropWindow:
         update_config_values({"enableTray": bool(self.tray_var.get())})
         if self.tray_var.get():
             self._ensure_tray()
-
-    def _on_copy(self):
-        if self._copy_flash_active:  # 「已复制 ✓」反馈期间防重入
-            return
-        self._run_action(copy=True, save=False)
-
-    def _on_save(self, kind: str):
-        if kind not in _SAVE_KINDS:
-            return
-        self._save_kind = kind
-        self._run_action(copy=False, save=True)
 
     def _on_uninstall_menu_selected(self):
         """菜单内两步确认：首点武装（3 秒不点弹回），二点进入既有卸载确认流程。"""
@@ -683,7 +692,7 @@ class DropWindow:
         self._copy_flash_active = False
         self.copy_button.config(text="复制到剪贴板", style="Primary.TButton")
 
-    def _run_action(self, copy: bool, save: bool):
+    def _start_scan(self):
         folders = self._iter_folder_paths()
         if not folders:
             self.status_var.set("请先添加要扫描的文件夹。")
@@ -700,21 +709,71 @@ class DropWindow:
             "size": self.size_var.get(),
             "time": self.time_var.get(),
         }
+        self._pending_scan_opts = self._scan_opt_snapshot()
+        self.scan_button.config(state="disabled")
         self.copy_button.config(state="disabled")
+        self.save_button.config(state="disabled")
         self.status_var.set("扫描中…")
         self._worker = threading.Thread(
-            target=self._worker_main, args=(folders, opts, copy, save, self._save_kind),
-            daemon=True,
+            target=self._worker_main, args=(folders, opts), daemon=True
         )
         self._worker.start()
 
-    def _worker_main(self, folders, opts, do_copy, do_save, save_kind="txt"):
-        fmt = opts["format"]
-        outputs = []
+    def _scan_opt_snapshot(self) -> dict:
+        """影响扫描结果的选项快照：这些值变化即要求重新扫描。
+        输出格式不在此列——格式只影响消费端（复制/保存）的现场格式化。"""
+        return {
+            "hide_git": self.hide_git_var.get(),
+            "gitignore": self.gitignore_var.get(),
+            "source_only": self.source_only_var.get(),
+            "size": self.size_var.get(),
+            "time": self.time_var.get(),
+        }
+
+    def _cache_valid(self) -> bool:
+        if not self._scan_cache or self._scan_opts != self._scan_opt_snapshot():
+            return False
+        return set(self._iter_folder_paths()) == set(self._scan_cache)
+
+    def _require_scan(self) -> bool:
+        if self._cache_valid():
+            return True
+        self._refresh_ready_card()
+        return False
+
+    def _on_scan(self):
+        """「扫描」按钮：显式触发扫描（唯一让缓存生效的入口）。"""
+        self._start_scan()
+
+    def _on_copy(self):
+        """「复制到剪贴板」：防重入 + 缓存守卫，只消费缓存，不重新扫描。"""
+        if self._copy_flash_active:
+            return
+        if not self._require_scan():
+            return
+        self._copy_from_cache()
+
+    def _on_save(self, kind: str):
+        """「保存为 ▾」：kind ∈ _SAVE_KINDS；缓存守卫通过后由主线程消费缓存。"""
+        if kind not in _SAVE_KINDS:
+            return
+        if not self._require_scan():
+            return
+        self._save_kind = kind
+        self._save_from_cache(kind)
+
+    def _start_scan_after_drop(self):
+        """拖入后自动复制：缓存有效直接复制；否则标记待复制并扫描，scan_done 续跑。"""
+        if self._cache_valid():
+            self._copy_from_cache()
+            return
+        self._pending_auto_copy = True
+        self._start_scan()
+
+    def _worker_main(self, folders, opts):
+        """只做扫描：结果经消息队列回传主线程落入 _scan_cache，不直接复制/保存。"""
         total_files = 0
         any_truncated = False
-        saved_name = None
-        saved_count = 0
         for folder in folders:
             try:
                 config = get_effective_config()
@@ -752,89 +811,129 @@ class DropWindow:
                     respect_gitignore=opts["gitignore"],
                 )
                 tree_text = build_tree_text(result, show_size=opts["size"], show_time=opts["time"])
-                output = format_output(
-                    tree_text, fmt, result=result, show_size=opts["size"], show_time=opts["time"]
-                )
-                outputs.append(output)
                 total_files += int(result.total_files)
                 if result.truncated:
                     any_truncated = True
 
-                # 表格文件数回填 + 预览填充都经队列回 Tk 主线程执行
+                # 表格文件数回填、扫描缓存、预览填充都经队列回 Tk 主线程执行
                 self.actions.put(("count", (folder, int(result.total_files))))
-                self.actions.put(("preview", tree_text))
+                # payload 必须是 (path, data) 二元组：_poll 统一按 kind, payload 解包
+                self.actions.put(("scanned", (folder, {
+                    "tree_text": tree_text,
+                    "result": result,
+                    "files": int(result.total_files),
+                    "truncated": bool(result.truncated),
+                })))
 
                 note = f"{result.total_files} 个文件，{result.total_dirs} 个文件夹"
                 if result.truncated:
                     note += f"（已截断：{describe_truncation(result)}）"
                 self.actions.put(("log", f"[完成] {folder} — {note}"))
-
-                if do_save:
-                    if save_kind == "md":
-                        filename = DEFAULT_OUTPUT_FILENAME_MD
-                        content = format_output(
-                            tree_text, "markdown", result=result,
-                            show_size=opts["size"], show_time=opts["time"])
-                    elif save_kind == "json":
-                        filename = DEFAULT_OUTPUT_FILENAME_JSON
-                        content = format_output(
-                            tree_text, "json", result=result,
-                            show_size=opts["size"], show_time=opts["time"])
-                    else:  # txt：沿用 tree_text，行为与旧版完全一致
-                        filename = DEFAULT_OUTPUT_FILENAME_TXT
-                        content = tree_text
-                    save_path = os.path.join(folder, filename)
-                    try:
-                        with open(save_path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                        saved_count += 1
-                        saved_name = filename
-                        self.actions.put(("log", f"[保存] {save_path}"))
-                    except OSError as e:
-                        self.actions.put(("log", f"[失败] 保存 {save_path}：{e}"))
             except Exception as e:  # 单个目录失败不影响其余目录
                 logger.exception("窗口扫描失败 {}", folder)
                 self.actions.put(("log", f"[失败] {folder} — {e}"))
 
-        if do_copy and outputs:
-            combined = "\n\n".join(outputs)
-            if copy_to_clipboard(combined):
-                self.actions.put(("done", {
-                    "action": "copy", "copy_ok": True,
-                    "truncated": any_truncated, "files": total_files,
-                    "message": f"已复制 {_fmt_count(total_files)} 个文件，结果已写入剪贴板。",
-                    "warn_message": f"已复制 {_fmt_count(total_files)} 个文件，超出上限，结果可能不完整",
-                }))
+        self.actions.put(("scan_done", {
+            "files": total_files,
+            "truncated": any_truncated,
+        }))
+
+    # ── 缓存消费：复制 / 保存 / 预览 ──
+
+    def _copy_from_cache(self):
+        fmt = _FORMAT_LABELS.get(self.format_var.get(), "text")
+        outputs = []
+        total_files = 0
+        any_truncated = False
+        for path in self._iter_folder_paths():
+            entry = self._scan_cache.get(path)
+            if entry is None:
+                continue
+            outputs.append(format_output(
+                entry["tree_text"], fmt, result=entry["result"],
+                show_size=self.size_var.get(), show_time=self.time_var.get(),
+            ))
+            total_files += entry["files"]
+            any_truncated = any_truncated or entry["truncated"]
+        combined = "\n\n".join(outputs)
+        if not outputs or not copy_to_clipboard(combined):
+            self._show_result_card({
+                "action": "copy", "copy_ok": False, "truncated": any_truncated,
+                "files": total_files, "message": "复制失败，请重试。", "warn_message": "",
+            })
+            return
+        self.copy_button.config(text="已复制 ✓", style="Success.TButton")
+        self._copy_flash_active = True
+        self.root.after(2000, self._reset_copy_button)
+        self._show_result_card({
+            "action": "copy", "copy_ok": True, "truncated": any_truncated,
+            "files": total_files,
+            "message": f"已复制 {_fmt_count(total_files)} 个文件，结果已写入剪贴板。",
+            "warn_message": f"已复制 {_fmt_count(total_files)} 个文件，超出上限，结果可能不完整",
+        })
+        self._append_log("")
+
+    def _save_from_cache(self, kind: str):
+        filename = {"txt": DEFAULT_OUTPUT_FILENAME_TXT,
+                    "md": DEFAULT_OUTPUT_FILENAME_MD,
+                    "json": DEFAULT_OUTPUT_FILENAME_JSON}[kind]
+        saved_count = 0
+        total_files = 0
+        any_truncated = False
+        for path in self._iter_folder_paths():
+            entry = self._scan_cache.get(path)
+            if entry is None:
+                continue
+            if kind == "txt":
+                content = entry["tree_text"]  # txt 沿用 tree_text，行为与旧版完全一致
             else:
-                self.actions.put(("log", "[失败] 剪贴板写入失败，请重试"))
-                self.actions.put(("done", {
-                    "action": "copy", "copy_ok": False,
-                    "truncated": False, "files": total_files,
-                    "message": "复制失败", "warn_message": "",
-                }))
-        elif do_copy:
-            self.actions.put(("done", {
-                "action": "copy", "copy_ok": False,
-                "truncated": any_truncated, "files": total_files,
-                "message": "没有可复制的内容。", "warn_message": "",
-            }))
-        elif do_save:
-            if saved_count:
-                message = f"已保存 {saved_name} 到 {saved_count} 个文件夹。"
-                warn_message = f"已保存 {saved_name}，超出上限，结果可能不完整"
-            else:
-                message, warn_message = "保存失败，详见日志。", ""
-            self.actions.put(("done", {
-                "action": "save", "copy_ok": False,
-                "truncated": any_truncated, "files": total_files,
-                "message": message, "warn_message": warn_message,
-            }))
+                # md/json 按保存类型对应格式现场格式化，保证文件内容与扩展名一致
+                content = format_output(
+                    entry["tree_text"], "markdown" if kind == "md" else "json",
+                    result=entry["result"],
+                    show_size=self.size_var.get(), show_time=self.time_var.get(),
+                )
+            save_path = os.path.join(path, filename)
+            try:
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                saved_count += 1
+                total_files += entry["files"]
+                any_truncated = any_truncated or entry["truncated"]
+                self._append_log(f"[保存] {save_path}")
+            except OSError as e:
+                self._append_log(f"[失败] 保存 {save_path}：{e}")
+        if saved_count:
+            self._show_result_card({
+                "action": "save", "copy_ok": False, "truncated": any_truncated,
+                "files": total_files,
+                "message": f"已保存 {filename} 到 {saved_count} 个文件夹。",
+                "warn_message": f"已保存 {filename}，超出上限，结果可能不完整",
+            })
         else:
-            self.actions.put(("done", {
-                "action": None, "copy_ok": False,
-                "truncated": any_truncated, "files": total_files,
-                "message": "处理完成。", "warn_message": "",
-            }))
+            self._show_result_card({
+                "action": "save", "copy_ok": False, "truncated": False,
+                "files": 0, "message": "保存失败，详见日志。", "warn_message": "",
+            })
+        self._append_log("")
+
+    def _on_folder_selected(self, _event=None):
+        """选中切换 → 预览跟随该文件夹的缓存结果；未扫描则提示先扫描。"""
+        selection = self.folder_tree.selection()
+        if not selection:
+            return
+        values = self.folder_tree.item(selection[0], "values")
+        if not values:
+            return
+        path = str(values[0])
+        entry = self._scan_cache.get(path)
+        if entry is None:
+            self.preview_text.config(state="normal")
+            self.preview_text.delete("1.0", "end")
+            self.preview_text.insert("1.0", f"{path}\n尚未扫描——点击「扫描」后此处显示该文件夹的目录树预览。")
+            self.preview_text.config(state="disabled")
+            return
+        self._update_preview(entry["tree_text"])
 
     # ── 预览与日志 ──
 
@@ -910,6 +1009,24 @@ class DropWindow:
                     self._update_row_count(path, total)
                 elif kind == "preview":
                     self._update_preview(payload)
+                elif kind == "scanned":
+                    path, data = payload
+                    self._scan_cache[path] = data
+                    if self.folder_tree.selection() and \
+                            str(self.folder_tree.item(self.folder_tree.selection()[0], "values")[0]) == path:
+                        self._update_preview(data["tree_text"])
+                elif kind == "scan_done":
+                    # 只在本次扫描确有选项快照时生效：seed/复用的既有缓存不被置为无效
+                    if self._pending_scan_opts is not None:
+                        self._scan_opts = self._pending_scan_opts
+                        self._pending_scan_opts = None
+                    self.scan_button.config(state="normal")
+                    self._refresh_ready_card()
+                    self._on_folder_selected()
+                    if self._pending_auto_copy:
+                        self._pending_auto_copy = False
+                        if self._cache_valid():
+                            self._copy_from_cache()
                 elif kind == "done":
                     self.copy_button.config(state="normal")
                     if isinstance(payload, dict):

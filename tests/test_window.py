@@ -63,6 +63,21 @@ def make_bare_window(**attrs):
     app._log_frame = mock.MagicMock()
     app.log_toggle_button = mock.MagicMock()
     app.drawer_frame = mock.MagicMock()
+    # 扫描状态层（根因修复契约）
+    app._scan_cache = {}
+    app._scan_opts = None
+    app._pending_scan_opts = None
+    app._pending_auto_copy = False
+    app.scan_button = mock.MagicMock()
+    # 扫描相关选项变量（_scan_opt_snapshot/_copy_from_cache/_save_from_cache 读取；
+    # get 返回值钉死为默认态，保证 seed 后 _cache_valid 的快照一致性可复现）
+    for _name in ("hide_git_var", "gitignore_var", "source_only_var",
+                  "size_var", "time_var"):
+        _var = mock.MagicMock()
+        _var.get.return_value = False
+        setattr(app, _name, _var)
+    app.format_var = mock.MagicMock()
+    app.format_var.get.return_value = "树状文本"
     for name, value in attrs.items():
         setattr(app, name, value)
     return app
@@ -95,7 +110,9 @@ class WorkerExcludePatternsTests(unittest.TestCase):
              mock.patch.object(window_module, "scan_directory", return_value=fake_result) as scan_mock, \
              mock.patch.object(window_module, "build_tree_text", return_value=""), \
              mock.patch.object(window_module, "format_output", return_value=""):
-            app._worker_main(["C:\\fake"], opts, do_copy=False, do_save=False)
+            # 改写理由（旧→新）：worker 只扫描，do_copy/do_save 动作参数已随
+            # 扫描状态层移除（复制/保存改由主线程消费缓存）
+            app._worker_main(["C:\\fake"], opts)
         return scan_mock.call_args.kwargs
 
     def test_filter_mode_passes_exclude_patterns_from_config(self):
@@ -105,10 +122,13 @@ class WorkerExcludePatternsTests(unittest.TestCase):
         self.assertEqual(kwargs["exclude_patterns"], {"*.log", "dist/*"})
 
     def test_non_filter_mode_keeps_exclude_patterns_off(self):
+        # 改写理由（旧→新）：worker 重写后以空集合（falsy）表达关闭；
+        # scanner 侧 `exclude_patterns or set()` 与 None 行为等价，
+        # 仍保证非过滤模式不做 glob 排除（评审 I-6 的行为契约不变）
         app = DropWindow.__new__(DropWindow)
         app.actions = queue.Queue()
         kwargs = self._run_worker(app, _scan_opts(hide_git=False))
-        self.assertIsNone(kwargs["exclude_patterns"])
+        self.assertFalse(kwargs["exclude_patterns"])
 
 
 class PollLoopTests(unittest.TestCase):
@@ -197,9 +217,15 @@ class ResultCardStateTests(unittest.TestCase):
         }
 
     def test_ready_state_lists_present_shows_total(self):
+        # 改写理由（旧→新）：新契约下「共 N 个文件待复制」仅在缓存有效时出现——
+        # 先 seed 缓存与选项快照再刷新结果卡（原测试未扫描即期待待复制态）
         app = make_bare_window()
         app.folder_tree.get_children.return_value = ("i1", "i2")
         app.folder_tree.item.return_value = (r"D:\a", "128", "✕")
+        app._scan_cache[r"D:\a"] = {
+            "tree_text": "", "result": _fake_scan_result(),
+            "files": 128, "truncated": False}
+        app._scan_opts = app._scan_opt_snapshot()
         app._refresh_ready_card()
         app.result_card.configure.assert_called_with(style="ResultCard.TFrame")
         app.result_link.pack_forget.assert_called_once()
@@ -209,11 +235,16 @@ class ResultCardStateTests(unittest.TestCase):
         self.assertIn("待复制", text)
 
     def test_ready_state_empty_list_shows_guidance(self):
+        # 改写理由（旧→新）：新契约合并「空列表」与「未扫描」态——初始统一提示
+        # 「请先执行扫描」（ScanStateTests.test_initial_buttons_disabled_with_scan_hint
+        # 契约），旧「就绪。拖入…」文案不再出现
         app = make_bare_window()  # get_children -> ()
         app._refresh_ready_card()
         text = app.status_var.set.call_args[0][0]
-        self.assertIn("就绪", text)
+        self.assertIn("请先执行扫描", text)
         app.result_card.configure.assert_called_with(style="ResultCard.TFrame")
+        app.copy_button.config.assert_called_with(state="disabled")
+        app.save_button.config.assert_called_with(state="disabled")
 
     def test_clean_done_keeps_card_normal(self):
         app = make_bare_window()
@@ -242,14 +273,32 @@ class ResultCardStateTests(unittest.TestCase):
         open_config.assert_called_once_with()
 
     def test_list_removal_returns_card_to_ready(self):
+        # 改写理由（旧→新）：新契约下删除行 → 缓存失效，结果卡回到
+        # 「请重新扫描」门卫态并禁用复制（旧断言「待复制」仅在缓存有效时出现）
         app = make_bare_window()
-        app.folder_tree.get_children.return_value = ("i1",)
-        app.folder_tree.item.return_value = (r"D:\a", "—", "✕")
+        paths = {"i0": r"D:\a", "i1": r"D:\b"}
+
+        def item(iid, column=None):
+            if column == "values":
+                return (paths[iid], "—", "✕")
+            return tuple()
+
+        app.folder_tree.item.side_effect = item
+        app.folder_tree.get_children.return_value = ("i0", "i1")
+        app._scan_cache = {
+            p: {"tree_text": p, "result": _fake_scan_result(),
+                "files": 1, "truncated": False}
+            for p in (r"D:\a", r"D:\b")
+        }
+        app._scan_opts = app._scan_opt_snapshot()
+        self.assertTrue(app._cache_valid())  # 前置：删除前缓存有效
+        app.folder_tree.get_children.return_value = ("i0",)  # 删除 i1 后仅剩 D:\a
         app._remove_row("i1")
         app.folder_tree.delete.assert_called_once_with("i1")
         text = app.status_var.set.call_args[0][0]
-        self.assertIn("待复制", text)
+        self.assertIn("重新扫描", text)
         app.result_link.pack_forget.assert_called_once()
+        app.copy_button.config.assert_called_with(state="disabled")
 
 
 class CopyFeedbackTests(unittest.TestCase):
@@ -267,21 +316,22 @@ class CopyFeedbackTests(unittest.TestCase):
         self.assertTrue(app._copy_flash_active)
 
     def test_reentry_blocked_while_flash_active(self):
+        # 改写理由（旧→新）：`_run_action` 已随扫描状态层移除，复制入口改为
+        # `_on_copy` 直接触发 `_copy_from_cache`；闪灯防重入语义不变
         app = make_bare_window()
         app._copy_flash_active = True
-        app.folder_tree.get_children.return_value = ("i1",)
-        app.folder_tree.item.return_value = (r"C:\x", "1", "✕")
-        with mock.patch.object(app, "_run_action") as run_action:
+        with mock.patch.object(app, "_copy_from_cache") as copy_cache:
             app._on_copy()
-        run_action.assert_not_called()
+        copy_cache.assert_not_called()
 
     def test_copy_allowed_when_flash_inactive(self):
+        # 改写理由（旧→新）：断言对象从 _run_action(copy=True, save=False)
+        # 改为 _copy_from_cache()——复制不再带动作参数进 worker，而是主线程消费缓存
         app = make_bare_window()
-        app.folder_tree.get_children.return_value = ("i1",)
-        app.folder_tree.item.return_value = (r"C:\x", "1", "✕")
-        with mock.patch.object(app, "_run_action") as run_action:
+        with mock.patch.object(app, "_copy_from_cache") as copy_cache, \
+             mock.patch.object(app, "_cache_valid", return_value=True):
             app._on_copy()
-        run_action.assert_called_once_with(copy=True, save=False)
+        copy_cache.assert_called_once_with()
 
     def test_reset_restores_button_text_and_style(self):
         app = make_bare_window()
@@ -322,88 +372,116 @@ class SaveMenuTests(unittest.TestCase):
                 on_save.assert_called_with(kind)
 
     def test_on_save_sets_kind_and_runs_save_action(self):
+        # 改写理由（旧→新）：保存不再经 `_run_action` 进 worker——新契约是
+        # 缓存有效时 `_on_save` 记录 kind 并由主线程 `_save_from_cache(kind)` 消费缓存
         app = make_bare_window()
         app.folder_tree.get_children.return_value = ("i1",)
         app.folder_tree.item.return_value = (r"C:\x", "1", "✕")
-        with mock.patch.object(app, "_run_action") as run_action:
+        app._scan_cache[r"C:\x"] = {
+            "tree_text": "T", "result": _fake_scan_result(),
+            "files": 1, "truncated": False}
+        app._scan_opts = app._scan_opt_snapshot()
+        with mock.patch.object(app, "_save_from_cache") as save:
             app._on_save("json")
         self.assertEqual(app._save_kind, "json")
-        run_action.assert_called_once_with(copy=False, save=True)
+        save.assert_called_once_with("json")
 
     def test_on_save_rejects_unknown_kind(self):
+        # 改写理由（旧→新）：拒绝语义不变，断言对象改为 `_save_from_cache` 不被调用
         app = make_bare_window()
-        with mock.patch.object(app, "_run_action") as run_action:
+        with mock.patch.object(app, "_save_from_cache") as save:
             app._on_save("xml")
-        run_action.assert_not_called()
+        save.assert_not_called()
+        self.assertEqual(app._save_kind, "txt")  # 未知 kind 不改变当前保存格式
 
 
 class SaveKindWorkerTests(unittest.TestCase):
-    """保存格式参数：txt 沿用 tree_text；md/json 写入对应格式的已格式化内容。"""
+    """保存格式（缓存消费等价测试）。
 
-    def _run_worker(self, save_kind, truncated=False):
-        app = DropWindow.__new__(DropWindow)
-        app.actions = queue.Queue()
-        fake_result = _fake_scan_result(total_files=3, truncated=truncated)
-        config = {"maxFiles": 2000, "maxItemsPerLevel": 200, "maxDepth": -1}
-        with mock.patch.object(window_module, "get_effective_config", return_value=config), \
-             mock.patch.object(window_module, "scan_directory", return_value=fake_result), \
-             mock.patch.object(window_module, "build_tree_text", return_value="L1\nL2\nL3"), \
-             mock.patch.object(window_module, "format_output", return_value="OUT") as fmt_mock, \
-             mock.patch("builtins.open", mock.mock_open()) as open_mock:
-            app._worker_main(["C:\\fake"], _scan_opts(), do_copy=False, do_save=True,
-                             save_kind=save_kind)
-        messages = []
-        while not app.actions.empty():
-            messages.append(app.actions.get_nowait())
-        return app, open_mock, fmt_mock, messages
+    改写理由（旧→新）：扫描状态层把 worker 保存流程整体移入主线程
+    `_save_from_cache(kind)`——worker 只扫描。原「worker 收 save_kind 写文件 /
+    发 done 消息」的断言改为缓存消费等价断言：txt 沿用 tree_text 写 _TXT
+    （兼容不变）；md/json 现场按对应格式 format_output 后写 _MD/_JSON；
+    完成消息改为 `_show_result_card` 收到的 payload；count/preview 改为
+    worker 发布 count + scanned + scan_done 的扫描流契约。
+    """
+
+    def _run_save(self, save_kind, truncated=False):
+        app = make_bare_window()
+        app.folder_tree.get_children.return_value = ("i1",)
+        app.folder_tree.item.return_value = (r"C:\fake", "1", "✕")
+        app._scan_cache[r"C:\fake"] = {
+            "tree_text": "L1\nL2\nL3",
+            "result": _fake_scan_result(total_files=3, truncated=truncated),
+            "files": 3,
+            "truncated": truncated,
+        }
+        app._scan_opts = app._scan_opt_snapshot()
+        with mock.patch.object(window_module, "format_output", return_value="OUT") as fmt_mock, \
+             mock.patch("builtins.open", mock.mock_open()) as open_mock, \
+             mock.patch.object(app, "_show_result_card") as card:
+            app._save_from_cache(save_kind)
+        return open_mock, fmt_mock, card
 
     def test_txt_save_writes_tree_text_to_txt_filename(self):
-        _app, open_mock, _fmt, _msgs = self._run_worker("txt")
+        open_mock, fmt_mock, _card = self._run_save("txt")
         expected = os.path.join("C:\\fake", "directory_tree.txt")
         open_mock.assert_called_once_with(expected, "w", encoding="utf-8")
         open_mock().write.assert_called_once_with("L1\nL2\nL3")
+        fmt_mock.assert_not_called()  # txt 沿用 tree_text，不做二次格式化（兼容不变）
 
     def test_md_save_writes_markdown_formatted_content(self):
-        _app, open_mock, fmt_mock, _msgs = self._run_worker("md")
+        open_mock, fmt_mock, _card = self._run_save("md")
         expected = os.path.join("C:\\fake", "directory_tree.md")
         open_mock.assert_called_once_with(expected, "w", encoding="utf-8")
-        formats = [c.args[1] for c in fmt_mock.call_args_list]
-        self.assertIn("markdown", formats)
+        self.assertEqual(fmt_mock.call_args.args[1], "markdown")
         open_mock().write.assert_called_once_with("OUT")
 
     def test_json_save_writes_json_formatted_content(self):
-        _app, open_mock, fmt_mock, _msgs = self._run_worker("json")
+        open_mock, fmt_mock, _card = self._run_save("json")
         expected = os.path.join("C:\\fake", "directory_tree.json")
         open_mock.assert_called_once_with(expected, "w", encoding="utf-8")
-        formats = [c.args[1] for c in fmt_mock.call_args_list]
-        self.assertIn("json", formats)
+        self.assertEqual(fmt_mock.call_args.args[1], "json")
         open_mock().write.assert_called_once_with("OUT")
 
-    def test_worker_publishes_count_and_preview_messages(self):
-        _app, _open, _fmt, messages = self._run_worker("txt")
+    def test_worker_publishes_count_and_scanned_messages(self):
+        app = DropWindow.__new__(DropWindow)
+        app.actions = queue.Queue()
+        fake_result = _fake_scan_result(total_files=3)
+        config = {"maxFiles": 2000, "maxItemsPerLevel": 200, "maxDepth": -1}
+        with mock.patch.object(window_module, "get_effective_config", return_value=config), \
+             mock.patch.object(window_module, "scan_directory", return_value=fake_result), \
+             mock.patch.object(window_module, "build_tree_text", return_value="L1\nL2\nL3"):
+            app._worker_main(["C:\\fake"], _scan_opts())
+        messages = []
+        while not app.actions.empty():
+            messages.append(app.actions.get_nowait())
         kinds = [kind for kind, _payload in messages]
         self.assertIn("count", kinds)
-        self.assertIn("preview", kinds)
+        self.assertIn("scanned", kinds)
+        self.assertIn("scan_done", kinds)
         count_payload = dict(p for k, p in messages if k == "count")
         self.assertEqual(count_payload["C:\\fake"], 3)
-        preview_payload = [p for k, p in messages if k == "preview"][0]
-        self.assertEqual(preview_payload, "L1\nL2\nL3")
+        path, data = [p for k, p in messages if k == "scanned"][0]
+        self.assertEqual(path, "C:\\fake")
+        self.assertEqual(data["tree_text"], "L1\nL2\nL3")
+        self.assertEqual(data["files"], 3)
 
-    def test_done_payload_carries_result_state(self):
-        _app, _open, _fmt, messages = self._run_worker("txt")
-        done = [p for k, p in messages if k == "done"][0]
-        self.assertIsInstance(done, dict)
-        self.assertEqual(done["action"], "save")
-        self.assertFalse(done["copy_ok"])
-        self.assertFalse(done["truncated"])
-        self.assertEqual(done["files"], 3)
-        self.assertIn("已保存", done["message"])
+    def test_save_payload_carries_result_state(self):
+        _open, _fmt, card = self._run_save("txt")
+        payload = card.call_args.args[0]
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["action"], "save")
+        self.assertFalse(payload["copy_ok"])
+        self.assertFalse(payload["truncated"])
+        self.assertEqual(payload["files"], 3)
+        self.assertIn("已保存", payload["message"])
 
     def test_truncated_save_marks_payload(self):
-        _app, _open, _fmt, messages = self._run_worker("txt", truncated=True)
-        done = [p for k, p in messages if k == "done"][0]
-        self.assertTrue(done["truncated"])
-        self.assertTrue(done["warn_message"])
+        _open, _fmt, card = self._run_save("txt", truncated=True)
+        payload = card.call_args.args[0]
+        self.assertTrue(payload["truncated"])
+        self.assertTrue(payload["warn_message"])
 
 
 class PreviewTests(unittest.TestCase):
@@ -529,6 +607,8 @@ class ClearConfirmTests(unittest.TestCase):
         app.root.after.assert_called_once_with(2500, app._disarm_clear)
 
     def test_second_click_clears_rows_and_returns_ready(self):
+        # 改写理由（旧→新）：新契约下「待复制」须以有效缓存为前提；清空列表后
+        # 缓存必然失效，结果卡回到「请先执行扫描」门卫态（旧断言不再成立）
         app = make_bare_window()
         app.folder_tree.get_children.return_value = ("i1", "i2")
         app._clear_armed = True
@@ -538,7 +618,8 @@ class ClearConfirmTests(unittest.TestCase):
         app.root.after_cancel.assert_called_once_with(77)
         app.clear_button.config.assert_called_with(text="清空全部", style="DangerGhost.TButton")
         app.result_link.pack_forget.assert_called_once()
-        self.assertIn("待复制", app.status_var.set.call_args[0][0])
+        self.assertIn("请先执行扫描", app.status_var.set.call_args[0][0])
+        app.copy_button.config.assert_called_with(state="disabled")
 
     def test_timeout_disarms_clear(self):
         app = make_bare_window()
@@ -550,31 +631,57 @@ class ClearConfirmTests(unittest.TestCase):
 
 
 class AutoCopyOnDropTests(unittest.TestCase):
-    """「拖入后自动复制」：开启时拖入文件夹触发一次 _on_copy。"""
+    """「拖入后自动复制」。
 
-    def _drop(self, paths, auto_copy):
+    改写理由（旧→新）：扫描状态层落地后 drop 不再直接 `_on_copy`——
+    `_handle_drop` 改经 `_start_scan_after_drop`：缓存有效 → 直接
+    `_copy_from_cache`（原「开启时拖入触发一次复制」的等价实现）；
+    缓存无效 → `_pending_auto_copy=True` + `_start_scan`，scan_done 续跑。
+    「auto 关闭永不触发」「纯文件拖入不触发」的原意图原样保留。
+    """
+
+    def _drop(self, paths, auto_copy, cache_valid_seed=False):
         app = make_bare_window()
         app.auto_copy_var.get.return_value = auto_copy
+        if cache_valid_seed:
+            app.folder_tree.get_children.return_value = ("i1",)
+            app.folder_tree.item.return_value = (r"D:\data", "1", "✕")
+            app._scan_cache[r"D:\data"] = {
+                "tree_text": "T", "result": _fake_scan_result(),
+                "files": 1, "truncated": False}
+            app._scan_opts = app._scan_opt_snapshot()
         with mock.patch.object(window_module.shell32, "DragQueryFileW",
                                side_effect=HandleDropTests._drop_paths_static(paths)), \
              mock.patch.object(window_module.shell32, "DragAcceptFiles"), \
              mock.patch.object(window_module.os.path, "isdir",
                                side_effect=lambda p: not p.endswith(".txt")), \
-             mock.patch.object(app, "_on_copy") as on_copy:
+             mock.patch.object(app, "_copy_from_cache") as copy_cache, \
+             mock.patch.object(app, "_start_scan") as start_scan:
             app._handle_drop(0xABC)
-        return app, on_copy
+        return app, copy_cache, start_scan
 
-    def test_enabled_copy_triggers_once_after_folder_drop(self):
-        _app, on_copy = self._drop([r"D:\data"], auto_copy=True)
-        on_copy.assert_called_once_with()
+    def test_enabled_cache_valid_copies_from_cache_after_drop(self):
+        _app, copy_cache, start_scan = self._drop([r"D:\data"], auto_copy=True,
+                                                  cache_valid_seed=True)
+        copy_cache.assert_called_once_with()
+        start_scan.assert_not_called()
+
+    def test_enabled_cache_invalid_defers_copy_to_scan(self):
+        app, copy_cache, start_scan = self._drop([r"D:\data"], auto_copy=True)
+        copy_cache.assert_not_called()
+        start_scan.assert_called_once_with()
+        self.assertTrue(app._pending_auto_copy)
 
     def test_disabled_copy_never_triggers(self):
-        _app, on_copy = self._drop([r"D:\data"], auto_copy=False)
-        on_copy.assert_not_called()
+        app, copy_cache, start_scan = self._drop([r"D:\data"], auto_copy=False)
+        copy_cache.assert_not_called()
+        start_scan.assert_not_called()
+        self.assertFalse(app._pending_auto_copy)
 
     def test_non_folder_drop_never_triggers(self):
-        _app, on_copy = self._drop([r"D:\notes.txt"], auto_copy=True)
-        on_copy.assert_not_called()
+        _app, copy_cache, start_scan = self._drop([r"D:\notes.txt"], auto_copy=True)
+        copy_cache.assert_not_called()
+        start_scan.assert_not_called()
 
 
 class HandleDropTests(unittest.TestCase):
@@ -675,7 +782,11 @@ class HandleDropTests(unittest.TestCase):
 
 
 class RunActionGuardTests(unittest.TestCase):
-    def test_run_action_ignored_while_worker_alive(self):
+    """扫描守卫（改写理由：`_run_action` 被扫描状态层移除，worker 只扫描，
+    复制/保存改在主线程消费缓存；空列表提示与 worker 存活忽略两条守卫语义
+    原样平移到 `_start_scan`）。"""
+
+    def test_start_scan_ignored_while_worker_alive(self):
         gate = threading.Event()
         alive = threading.Thread(target=gate.wait)
         alive.start()
@@ -686,36 +797,42 @@ class RunActionGuardTests(unittest.TestCase):
         app.folder_tree.get_children.return_value = ("i1",)
         app.folder_tree.item.return_value = (r"C:\fake", "—", "✕")
         with mock.patch.object(window_module.threading, "Thread") as thread_ctor:
-            app._run_action(copy=True, save=False)
+            app._start_scan()
         thread_ctor.assert_not_called()
         app.status_var.set.assert_called_once()
         self.assertIn("上一批", app.status_var.set.call_args[0][0])
 
-    def test_empty_list_copy_shows_hint_without_worker(self):
+    def test_empty_list_scan_shows_hint_without_worker(self):
         app = make_bare_window()  # 列表为空
         with mock.patch.object(window_module.threading, "Thread") as thread_ctor:
-            app._run_action(copy=True, save=False)
+            app._start_scan()
         thread_ctor.assert_not_called()
         app.status_var.set.assert_called_once_with("请先添加要扫描的文件夹。")
 
-    def test_worker_thread_receives_save_kind(self):
+    def test_worker_thread_receives_only_folders_and_opts(self):
+        """改写理由：旧契约「worker 线程参数末位是 save_kind」随保存流程移入
+        `_save_from_cache`（主线程消费缓存）而不再成立；等价新契约是
+        `_start_scan` 给线程的位置参数恰为 (folders, opts)，不携带任何
+        复制/保存动作参数——worker 职责收敛为纯扫描。"""
         app = make_bare_window()
         app.folder_tree.get_children.return_value = ("i1",)
         app.folder_tree.item.return_value = (r"C:\fake", "—", "✕")
-        # _run_action 读取界面选项变量，注入 mock 供线程参数组装
-        for name in ("format_var", "hide_git_var", "gitignore_var",
-                     "source_only_var", "size_var", "time_var"):
-            setattr(app, name, mock.MagicMock())
         app._save_kind = "md"
         started = {}
 
         def fake_thread(target, args, daemon):
+            started["target"] = target
             started["args"] = args
             return mock.MagicMock()
 
         with mock.patch.object(window_module.threading, "Thread", side_effect=fake_thread):
-            app._run_action(copy=False, save=True)
-        self.assertEqual(started["args"][-1], "md")
+            app._start_scan()
+        self.assertEqual(started["target"], app._worker_main)
+        folders, opts = started["args"]
+        self.assertEqual(folders, [r"C:\fake"])
+        self.assertEqual(
+            set(opts), {"format", "hide_git", "gitignore", "source_only", "size", "time"})
+        self.assertNotIn("save_kind", opts)
 
 
 class TrayToggleTests(unittest.TestCase):
@@ -958,3 +1075,172 @@ class InstallBannerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScanStateTests(unittest.TestCase):
+    """扫描状态层（根因修复契约）：
+    显式「扫描」→ 结果缓存（每文件夹）→ 选中切换预览 → 复制/保存只消费缓存。
+    列表或扫描相关选项变化 → 缓存失效，复制/保存禁用，直到重新扫描。"""
+
+    def _make(self, folders=(("C:\\a", "128"), ("C:\\b", "3,412"))):
+        app = make_bare_window()
+        rows = [(f"i{i}", p, n) for i, (p, n) in enumerate(folders)]
+
+        def item(iid, column=None):
+            for r in rows:
+                if r[0] == iid and column == "values":
+                    return (r[1], r[2], "✕")
+            return tuple()
+
+        app.folder_tree.get_children.return_value = tuple(r[0] for r in rows)
+        app.folder_tree.item.side_effect = item
+        app.folder_tree.selection.return_value = (rows[0][0],) if rows else tuple()
+
+        def flag(value=False):
+            v = mock.Mock()
+            v.get.return_value = value
+            return v
+
+        app.hide_git_var = flag()
+        app.gitignore_var = flag()
+        app.source_only_var = flag()
+        app.size_var = flag()
+        app.time_var = flag()
+        app.format_var = flag("Markdown 代码块")
+        app._scan_cache = {}
+        app._scan_opts = None
+        app._pending_scan_opts = None
+        app._pending_auto_copy = False
+        return app, rows
+
+    def _seed(self, app, texts):
+        for path, text in texts.items():
+            app._scan_cache[path] = {
+                "tree_text": text,
+                "result": _fake_scan_result(total_files=10),
+                "files": 10,
+                "truncated": False,
+            }
+        app._scan_opts = app._scan_opt_snapshot()
+
+    def _config(self):
+        return {"excludeDirs": [], "excludeFiles": [], "excludePatterns": [],
+                "maxFiles": 2000, "maxItemsPerLevel": 200, "maxDepth": -1}
+
+    # ── 就绪门卫 ──
+
+    def test_initial_buttons_disabled_with_scan_hint(self):
+        app, _ = self._make(folders=())
+        app._refresh_ready_card()
+        app.copy_button.config.assert_called_with(state="disabled")
+        app.save_button.config.assert_called_with(state="disabled")
+        status = app.status_var.set.call_args[0][0]
+        self.assertIn("请先执行扫描", status)
+
+    def test_scan_fills_cache_and_enables_buttons(self):
+        app, _ = self._make()
+        app._on_scan()
+        app._worker.join(timeout=5)
+        app._poll()
+        self.assertEqual(set(app._scan_cache), {"C:\\a", "C:\\b"})
+        app.copy_button.config.assert_called_with(state="normal")
+        app.save_button.config.assert_called_with(state="normal")
+
+    def test_scan_button_wiring_calls_start(self):
+        app, _ = self._make()
+        with mock.patch.object(app, "_start_scan") as start:
+            app._on_scan()
+        start.assert_called_once_with()
+
+    # ── 选中 → 预览 ──
+
+    def test_selection_switch_updates_preview_from_cache(self):
+        app, _ = self._make()
+        self._seed(app, {"C:\\a": "TREE-A", "C:\\b": "TREE-B"})
+        app.folder_tree.selection.return_value = ("i1",)
+        app._on_folder_selected()
+        inserted = "".join(str(c.args[1]) for c in app.preview_text.insert.call_args_list)
+        self.assertIn("TREE-B", inserted)
+        app.folder_tree.selection.return_value = ("i0",)
+        app._on_folder_selected()
+        inserted = "".join(str(c.args[1]) for c in app.preview_text.insert.call_args_list)
+        self.assertIn("TREE-A", inserted)
+
+    def test_unscanned_selection_shows_hint(self):
+        app, _ = self._make()
+        self._seed(app, {"C:\\a": "TREE-A"})  # C:\b 未扫描
+        app.folder_tree.selection.return_value = ("i1",)
+        app._on_folder_selected()
+        inserted = "".join(str(c.args[1]) for c in app.preview_text.insert.call_args_list)
+        self.assertIn("尚未扫描", inserted)
+
+    # ── 复制/保存消费缓存 ──
+
+    def test_copy_consumes_cache_without_rescan(self):
+        app, _ = self._make()
+        self._seed(app, {"C:\\a": "TA", "C:\\b": "TB"})
+        with mock.patch.object(window_module, "copy_to_clipboard", return_value=True) as clip, \
+             mock.patch.object(window_module, "format_output", return_value="FMT") as fmt:
+            app._on_copy()
+        clip.assert_called_once_with("FMT\n\nFMT")
+        self.assertEqual(fmt.call_args.args[1], "markdown")
+        self.assertIsNone(app._worker)
+
+    def test_save_from_cache_writes_selected_format(self):
+        import shutil
+        import tempfile
+        app, _ = self._make()
+        tmp = Path(tempfile.mkdtemp(prefix="scan_state_"))
+        target = str(tmp / "one")
+        Path(target).mkdir()
+        app.folder_tree.get_children.return_value = ("i0",)
+        app.folder_tree.item.side_effect = (
+            lambda iid, column=None: (target, "10", "✕") if column == "values" else tuple())
+        self._seed(app, {target: "RAWTREE"})
+        with mock.patch.object(window_module, "format_output", return_value="# MD") as fmt:
+            app._on_save("md")
+        written = (Path(target) / "directory_tree.md").read_text(encoding="utf-8")
+        self.assertEqual(written, "# MD")
+        fmt.assert_called_once()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── 失效 ──
+
+    def test_options_change_invalidates_cache(self):
+        app, _ = self._make()
+        self._seed(app, {"C:\\a": "TA", "C:\\b": "TB"})
+        self.assertTrue(app._cache_valid())
+        app.size_var.get.return_value = True
+        self.assertFalse(app._cache_valid())
+        app._refresh_ready_card()
+        app.copy_button.config.assert_called_with(state="disabled")
+
+    def test_list_change_invalidates_cache(self):
+        app, _ = self._make()
+        self._seed(app, {"C:\\a": "TA", "C:\\b": "TB"})
+        app.folder_tree.get_children.return_value = ("i0",)  # 删除一行后
+        app._refresh_ready_card()
+        self.assertFalse(app._cache_valid())
+        app.copy_button.config.assert_called_with(state="disabled")
+
+    # ── 自动复制链 ──
+
+    def test_drop_with_auto_copy_starts_scan_when_cache_invalid(self):
+        app, _ = self._make()
+        app.auto_copy_var.get.return_value = True
+        app._pending_auto_copy = True
+        with mock.patch.object(app, "_start_scan") as start:
+            app._start_scan_after_drop()
+        start.assert_called_once_with()
+        self.assertTrue(app._pending_auto_copy)
+
+    def test_scan_done_runs_pending_auto_copy(self):
+        app, _ = self._make()
+        self._seed(app, {"C:\\a": "TA", "C:\\b": "TB"})
+        app._pending_auto_copy = True
+        with mock.patch.object(window_module, "copy_to_clipboard", return_value=True) as clip, \
+             mock.patch.object(window_module, "format_output", return_value="FMT"):
+            app.actions.put(("scan_done", {"files": 20, "truncated": False}))
+            app._poll()
+        clip.assert_called_once()
+        self.assertFalse(app._pending_auto_copy)
